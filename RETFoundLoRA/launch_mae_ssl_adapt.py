@@ -82,6 +82,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--max-images", type=int, default=0, help="Optional cap for quick smoke checks (0 = all).")
     p.add_argument("--skip-missing", action="store_true", help="Skip missing image paths instead of failing.")
+    p.add_argument(
+        "--skip-unreadable",
+        action="store_true",
+        help="Skip unreadable/corrupt images during RGB export and log them (useful with --force-rgb-export).",
+    )
     p.add_argument("--run-name", type=str, default="rat_oct_ssl_mae_transductive")
 
     # MAE launch config (command generation)
@@ -190,6 +195,8 @@ def _prepare_imagefolder(
     skip_missing: bool,
     force_rgb_export: bool = False,
     rgb_export_format: str = "png",
+    skip_unreadable: bool = False,
+    failure_rows: Optional[List[Dict[str, object]]] = None,
 ) -> pd.DataFrame:
     imagefolder_root = out_dir / "imagefolder"
     class_dir = imagefolder_root / class_name
@@ -222,7 +229,21 @@ def _prepare_imagefolder(
         dst_name = f"{i:06d}_{stem}_{suffix_hash}{ext}"
         dst = class_dir / dst_name
         if force_rgb_export:
-            _export_rgb(src, dst, fmt=str(rgb_export_format))
+            try:
+                _export_rgb(src, dst, fmt=str(rgb_export_format))
+            except Exception as e:
+                if not skip_unreadable:
+                    raise
+                if failure_rows is not None:
+                    failure_rows.append(
+                        {
+                            "row_index": int(i),
+                            "image_path": str(src),
+                            "error_type": type(e).__name__,
+                            "error": str(e),
+                        }
+                    )
+                continue
         else:
             _link_or_copy(src, dst, copy_images=copy_images)
         if train_class_dir.is_dir() and not train_class_dir.is_symlink():
@@ -356,6 +377,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     df = _load_manifest(manifest_path)
+    export_failures: List[Dict[str, object]] = []
     prepared_df = _prepare_imagefolder(
         df=df,
         out_dir=out_dir,
@@ -365,6 +387,8 @@ def main() -> None:
         skip_missing=bool(args.skip_missing),
         force_rgb_export=bool(args.force_rgb_export),
         rgb_export_format=str(args.rgb_export_format),
+        skip_unreadable=bool(args.skip_unreadable),
+        failure_rows=export_failures,
     )
     if prepared_df.empty:
         raise RuntimeError("Prepared SSL ImageFolder is empty.")
@@ -372,6 +396,9 @@ def main() -> None:
     # Persist a clean prepared manifest (contains original metadata + linked path)
     prepared_manifest = out_dir / "prepared_ssl_manifest.csv"
     prepared_df.to_csv(prepared_manifest, index=False)
+    failures_csv = out_dir / "image_export_failures.csv"
+    if export_failures:
+        pd.DataFrame(export_failures).to_csv(failures_csv, index=False)
 
     imagefolder_root = out_dir / "imagefolder"
     pretrain_script = _resolve_pretrain_script(args.pretrain_script)
@@ -396,6 +423,9 @@ def main() -> None:
         "force_rgb_export": bool(args.force_rgb_export),
         "rgb_export_format": str(args.rgb_export_format),
         "max_images": int(args.max_images or 0),
+        "skip_unreadable": bool(args.skip_unreadable),
+        "n_export_failures": int(len(export_failures)),
+        "export_failures_csv": str(failures_csv) if export_failures else None,
         "run_name": str(args.run_name),
         "launch_backend": str(args.launch_backend),
         "pretrain_script": str(pretrain_script) if pretrain_script is not None else None,
@@ -411,6 +441,8 @@ def main() -> None:
 
     print(f"[SSL-MAE] Prepared ImageFolder root: {imagefolder_root}")
     print(f"[SSL-MAE] Prepared manifest rows: {len(prepared_df)} (from input {len(df)})")
+    if export_failures:
+        print(f"[SSL-MAE][WARN] Skipped unreadable images during export: {len(export_failures)} (logged to {failures_csv})")
     print(f"[SSL-MAE] Prepared manifest: {prepared_manifest}")
     print(f"[SSL-MAE] Launch script: {command_sh}")
 

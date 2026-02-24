@@ -67,8 +67,48 @@ Plan details and exact commands are in:
 - `RETFoundLoRA/launch_mae_ssl_adapt.py`
   - manifest -> MAE-compatible `ImageFolder`
   - optional RGB export for grayscale OCT
+  - `--skip-unreadable` support for corrupt/unreadable source images (logs skipped files and continues)
   - MAE CLI arg autodetection (`main_pretrain.py -h`)
   - launch script generation / execution
+
+## Current Best MAE-Adapted Setup (Transductive SSL, <=90-Day Supervised Protocol)
+
+This is the current best **transductive SSL** result in this repo (unlabeled MAE adaptation on all rats, then supervised `MIL + LoRA` age regression).
+
+Protocol:
+- MAE continued pretraining on unlabeled rat OCT (Controls + HLS, cohorts `1/2/3`, all ages), reported as **transductive SSL**
+- supervised training on days `0/7/14/28/90` only
+- control evaluation restricted to day `0/90`
+
+Supervised command (MAE-adapted backbone init):
+
+```bash
+python3 RETFoundLoRA/run.py \
+  --mil-attention \
+  --no-mil-freeze-backbone \
+  --lora-blocks 4 \
+  --mil-attn-dim 256 \
+  --mil-hidden-dim 512 \
+  --epochs 40 \
+  --lr 1e-4 \
+  --day-whitelist 0 7 14 28 90 \
+  --control-eval-days 0 90 \
+  --aug-level mild \
+  --no-photometric-aug \
+  --no-bias-correction \
+  --backbone-ckpt outputs/ssl_adapt/mae_transductive_c123_allages_fbmae_run50_live/mae_run/output_resume_from_e0/checkpoint-49.pth \
+  --post-control-inter-eye-analysis
+```
+
+Observed results (this protocol):
+- Control (`day 0/90`): `MAE=35.04`, `RMSE=57.75`, `R²=0.587`
+- HLS (`0/7/14/28/90`): `MAE=25.94`, `RMSE=42.70`, `R²=0.783`
+- Control inter-eye mean `|OD-OS|`: `16.41`
+- HLS inter-eye mean `|OD-OS|`: `13.05`
+
+Caveat:
+- This result is **transductive SSL** and should be reported separately from strict train-rats-only SSL.
+- It beat the closest available non-SSL `<=90` staged comparator in both accuracy and inter-eye metrics, but a strict from-scratch non-SSL `<=90` ablation is still recommended.
 
 ## Bias Correction Warning
 

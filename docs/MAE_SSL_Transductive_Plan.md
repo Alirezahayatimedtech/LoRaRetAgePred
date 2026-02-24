@@ -20,8 +20,25 @@ This repo currently supports both manifest types and makes the protocol explicit
 - `RETFoundLoRA/launch_mae_ssl_adapt.py`
   - prepares MAE-compatible `ImageFolder`
   - supports `--force-rgb-export` for grayscale OCT compatibility
+  - supports `--skip-unreadable` to log and skip corrupt source files during export
   - autodetects common MAE CLI flags from `main_pretrain.py -h`
   - can generate a launch script or execute directly
+
+## Status Update (Completed Transductive MAE Run)
+
+A full transductive MAE adaptation run has been completed locally:
+- backend: `facebookresearch/mae` (`main_pretrain.py`) patched with `--init_ckpt` for RETFound init
+- init: RETFound-Large checkpoint
+- data: transductive unlabeled rat OCT manifest (`Controls + HLS`, cohorts `1/2/3`, all ages)
+- duration: `50` epochs (`0..49`)
+
+Notes from the run:
+- `7071 / 7073` images exported for SSL
+- `2` unreadable images skipped (logged via `--skip-unreadable`)
+- final MAE train loss (epoch 49): `0.1003`
+
+Resulting MAE checkpoint (example path used downstream):
+- `outputs/ssl_adapt/mae_transductive_c123_allages_fbmae_run50_live/mae_run/output_resume_from_e0/checkpoint-49.pth`
 
 ## Current Unlabeled Manifests (Example)
 
@@ -82,6 +99,24 @@ Compare on:
 - Control MAE/RMSE and inter-eye `|OD-OS|`
 - HLS MAE/RMSE
 - cohort/day slices (especially harder cohorts / later days)
+
+### Current Best MAE-Adapted Supervised Result (Transductive, `<=90` Protocol)
+
+Using the MAE-adapted backbone checkpoint above with the supervised setting:
+- `MIL + LoRA-4`
+- `mil_attn_dim=256`, `mil_hidden_dim=512`
+- `aug_level=mild`, `--no-photometric-aug`
+- `--day-whitelist 0 7 14 28 90`
+- `--control-eval-days 0 90`
+- `--lr 1e-4`, `--epochs 40`
+
+Observed metrics:
+- Control (`day 0/90`): `MAE=35.04`, `RMSE=57.75`, `R²=0.587`
+- HLS (`0/7/14/28/90`): `MAE=25.94`, `RMSE=42.70`, `R²=0.783`
+- Control inter-eye mean `|OD-OS|`: `16.41`
+- HLS inter-eye mean `|OD-OS|`: `13.05`
+
+This outperformed the closest available non-SSL staged `<=90` comparator in both accuracy and inter-eye metrics, but should still be labeled **transductive SSL**.
 
 ## Reporting Guidance
 
