@@ -118,6 +118,31 @@ Observed metrics:
 
 This outperformed the closest available non-SSL staged `<=90` comparator in both accuracy and inter-eye metrics, but should still be labeled **transductive SSL**.
 
+### Current Best MAE-Adapted Supervised Result (Transductive, Control-Priority `day 0/90` Protocol)
+
+When the main target is **control day 0/90** accuracy and inter-eye consistency (instead of broader HLS performance across more days), the better supervised protocol was:
+
+- `MIL + LoRA-4`
+- `mil_attn_dim=256`, `mil_hidden_dim=512`
+- `aug_level=mild`, `--no-photometric-aug`
+- `--day-whitelist 0 90`
+- `--control-eval-days 0 90`
+- `--cohorts 1 2 3`
+- `--lr 1e-4`, `--epochs 40`
+
+Observed metrics:
+- Control (`day 0/90`): `MAE=34.90`, `RMSE=58.08`, `R²=0.583`
+- HLS (`day 0/90`): `MAE=31.78`, `RMSE=50.16`, `R²=0.709`
+- Control inter-eye mean `|OD-OS|`: `13.98`
+- HLS inter-eye mean `|OD-OS|`: `13.19`
+
+Checkpoint:
+- `outputs/checkpoints/retfound_mil_e40_lora4_attn256_h512_mild_mae50transductive_lr1e4_d0090_c123.pt`
+
+Tradeoff relative to the `<=90` supervised protocol:
+- Better control metrics and control inter-eye consistency
+- Worse HLS metrics than training on `0/7/14/28/90`
+
 ## Reporting Guidance
 
 When presenting results, label clearly:

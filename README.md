@@ -110,6 +110,49 @@ Caveat:
 - This result is **transductive SSL** and should be reported separately from strict train-rats-only SSL.
 - It beat the closest available non-SSL `<=90` staged comparator in both accuracy and inter-eye metrics, but a strict from-scratch non-SSL `<=90` ablation is still recommended.
 
+## Current Best MAE-Adapted Setup (Control-Priority, Day 0/90 Only Supervised Protocol)
+
+Use this configuration when the primary objective is **Controls day 0/90** accuracy and inter-eye consistency (not broader HLS generalization across more days).
+
+Protocol:
+- MAE continued pretraining on unlabeled rat OCT (Controls + HLS, cohorts `1/2/3`, all ages), reported as **transductive SSL**
+- supervised training on days `0/90` only
+- control and HLS evaluation both restricted to day `0/90` (via `--day-whitelist 0 90`)
+
+Supervised command (MAE-adapted backbone init):
+
+```bash
+python3 RETFoundLoRA/run.py \
+  --mil-attention \
+  --no-mil-freeze-backbone \
+  --lora-blocks 4 \
+  --mil-attn-dim 256 \
+  --mil-hidden-dim 512 \
+  --epochs 40 \
+  --lr 1e-4 \
+  --day-whitelist 0 90 \
+  --control-eval-days 0 90 \
+  --cohorts 1 2 3 \
+  --aug-level mild \
+  --no-photometric-aug \
+  --no-bias-correction \
+  --backbone-ckpt outputs/ssl_adapt/mae_transductive_c123_allages_fbmae_run50_live/mae_run/output_resume_from_e0/checkpoint-49.pth \
+  --post-control-inter-eye-analysis
+```
+
+Observed results (control-priority protocol):
+- Control (`day 0/90`): `MAE=34.90`, `RMSE=58.08`, `R²=0.583`
+- HLS (`day 0/90`): `MAE=31.78`, `RMSE=50.16`, `R²=0.709`
+- Control inter-eye mean `|OD-OS|`: `13.98`
+- HLS inter-eye mean `|OD-OS|`: `13.19`
+
+Checkpoint:
+- `outputs/checkpoints/retfound_mil_e40_lora4_attn256_h512_mild_mae50transductive_lr1e4_d0090_c123.pt`
+
+Tradeoff vs the `<=90` supervised protocol:
+- Better control metrics and control inter-eye consistency
+- Worse HLS accuracy (and slightly worse HLS inter-eye) than training on `0/7/14/28/90`
+
 ## Bias Correction Warning
 
 For fair model comparison and deployable inference behavior, use:
