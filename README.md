@@ -1,44 +1,74 @@
 # LoRaRetAgePred
 
-RETFound-based age regression pipeline with:
-- LoRA fine-tuning options
-- deterministic robust intensity normalization
-- attention-MIL baseline (bag = `rat_id, eye, day`)
-- control/HLS evaluation + inter-eye analysis workflow
+RETFound-based OCT age regression pipeline with:
+- LoRA fine-tuning for ViT RETFound backbones
+- attention-MIL for many images/views per eye (`bag = rat_id, eye, day`)
+- deterministic robust intensity normalization (train + eval)
+- control/HLS evaluation and inter-eye reliability analysis
+- SSL tooling for MAE-style domain adaptation on unlabeled rat OCT
 
 ## Repo Contents
 
-- `RETFoundLoRA/`: training, evaluation, RETFound+LoRA model, MIL mode, trainer
-- `data_prep_age_lora.py`: shared metadata loading, transforms, datasets, bag dataset
+- `RETFoundLoRA/`: training/eval code, RETFound+LoRA model, MIL mode, diagnostics, SSL manifest/launcher tools
+- `data_prep_age_lora.py`: shared metadata loading, transforms, image datasets, MIL bag datasets
 
-## Recommended Simple Baseline (MIL, Frozen RETFound)
+## Current Best Supervised Setup (No SSL)
 
-This is the simplest workable mode for many images per case without fusion.
-
-- Uses attention-MIL over all images in each `(rat_id, eye, day)` bag
-- Disables fusion modes automatically
-- Freezes RETFound backbone in MIL baseline (`lora_blocks=0` forced)
+Best performing configuration so far in this project:
+- `MIL + LoRA` with `lora_blocks=4`
+- `--mil-attn-dim 256 --mil-hidden-dim 512`
+- `--aug-level mild`
+- `--no-photometric-aug`
+- train on all ages, control eval restricted to day `0/90`
+- `--no-bias-correction` for honest model selection
 
 ```bash
 python3 RETFoundLoRA/run.py \
   --mil-attention \
-  --epochs 30 \
-  --early-stop-patience 1000 \
+  --no-mil-freeze-backbone \
+  --lora-blocks 4 \
+  --mil-attn-dim 256 \
+  --mil-hidden-dim 512 \
+  --epochs 20 \
   --all-ages \
   --control-eval-days 0 90 \
+  --aug-level mild \
   --no-photometric-aug \
   --no-bias-correction \
-  --batch-size 4 \
-  --save-lora outputs/checkpoints/retfound_mil_e30_frozen_retfound.pt \
-  --pred-csv outputs/predictions/retfound_mil_e30_frozen_retfound/predictions.csv \
-  --metrics-csv outputs/predictions/retfound_mil_e30_frozen_retfound/metrics_summary.csv
+  --post-control-inter-eye-analysis \
+  --post-control-matched-view
 ```
 
-## Notes
+## Inter-Eye Reliability Tools
 
-- `--batch-size` in MIL mode means **bags per batch**, not images per batch.
-- `--control-eval-days 0 90` restricts only control evaluation outputs/metrics, not HLS test days.
-- `--no-photometric-aug` disables train-time photometric augmentation but keeps fixed robust intensity normalization.
+Added utilities for control-first reliability analysis:
+- `RETFoundLoRA/annotate_inter_eye_reliability.py`: annotate paired OD/OS CSVs with control-derived q95/q99 flags
+- `RETFoundLoRA/control_matched_view_infer.py`: control-only matched-view MIL re-inference diagnostic
+- `RETFoundLoRA/run.py` post-steps:
+  - `--post-control-inter-eye-analysis`
+  - `--post-control-matched-view`
+
+## SSL / MAE Domain Adaptation (Next Major Plan)
+
+We are moving toward **MAE-style continued pretraining on unlabeled rat OCT** starting from RETFound weights, then re-running the same supervised `MIL + LoRA` pipeline.
+
+Why:
+- reduce human -> rat OCT domain gap
+- improve cohort generalization (especially harder cohorts / older ages)
+- use all unlabeled OCT without age-label leakage
+
+Plan details and exact commands are in:
+- `docs/MAE_SSL_Transductive_Plan.md`
+
+### Included SSL tooling
+
+- `RETFoundLoRA/build_ssl_manifests.py`
+  - builds strict vs transductive unlabeled manifests from the current split logic
+- `RETFoundLoRA/launch_mae_ssl_adapt.py`
+  - manifest -> MAE-compatible `ImageFolder`
+  - optional RGB export for grayscale OCT
+  - MAE CLI arg autodetection (`main_pretrain.py -h`)
+  - launch script generation / execution
 
 ## Bias Correction Warning
 
@@ -48,20 +78,10 @@ For fair model comparison and deployable inference behavior, use:
 --no-bias-correction
 ```
 
-The current linear bias-correction path is a retrospective calibration method and can use true age during correction application.
+The current linear bias-correction path is retrospective and can use true age during correction application.
 
-## Quick Smoke Test (MIL)
+## Notes
 
-```bash
-python3 RETFoundLoRA/run.py \
-  --mil-attention \
-  --epochs 1 \
-  --batch-size 4 \
-  --all-ages \
-  --control-eval-days 0 90 \
-  --no-photometric-aug \
-  --save-lora outputs/checkpoints/mil_smoke_1epoch.pt \
-  --pred-csv outputs/predictions/mil_smoke_1epoch/predictions.csv \
-  --metrics-csv outputs/predictions/mil_smoke_1epoch/metrics_summary.csv
-```
-
+- `--batch-size` in MIL mode means **bags per batch**, not images per batch.
+- `--control-eval-days 0 90` only restricts the control evaluation path (not HLS days).
+- `--no-photometric-aug` disables train-time photometric augmentation but keeps fixed robust intensity normalization.

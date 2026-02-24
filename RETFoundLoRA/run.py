@@ -10,6 +10,9 @@ from pathlib import Path
 import copy
 import json
 import shutil
+import re
+import subprocess
+from typing import Optional
 
 import pandas as pd
 import torch
@@ -154,11 +157,110 @@ def load_correction_json(path: Path):
     return (ctype, corr)
 
 
+def parse_progressive_lora_schedule(spec: str):
+    """
+    Parse progressive LoRA schedule text into 1-based epoch starts.
+
+    Format (blocks:start_epoch):
+      "2:0,4:6,6:12"  # 0-based starts accepted and converted to 1-based
+      "2:1,4:7,6:13"  # equivalent 1-based form
+    Returns: [(start_epoch_1based, active_blocks), ...]
+    """
+    if spec is None:
+        return None
+    txt = str(spec).strip()
+    if not txt:
+        return None
+
+    parsed = []
+    for chunk in txt.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = re.match(r"^(\d+)\s*[:@]\s*(\d+)$", chunk)
+        if not m:
+            raise ValueError(
+                f"Invalid progressive LoRA token '{chunk}'. "
+                "Use format like '2:0,4:6,6:12' (blocks:start_epoch)."
+            )
+        blocks = int(m.group(1))
+        start = int(m.group(2))
+        parsed.append((start, blocks))
+
+    if not parsed:
+        return None
+    parsed.sort(key=lambda x: x[0])
+    starts = [s for s, _ in parsed]
+    if len(starts) != len(set(starts)):
+        raise ValueError("Duplicate start epochs in progressive LoRA schedule.")
+
+    # Support 0-based starts for convenience.
+    if starts[0] == 0:
+        parsed = [(s + 1, b) for s, b in parsed]
+
+    for start_epoch, blocks in parsed:
+        if start_epoch < 1:
+            raise ValueError("Progressive LoRA schedule start epochs must be >= 1.")
+        if blocks < 0:
+            raise ValueError("Progressive LoRA schedule block counts must be >= 0.")
+    return parsed
+
+
+def active_lora_blocks_for_epoch(epoch: int, schedule, default_blocks: int) -> int:
+    """Resolve active LoRA block count for a given 1-based epoch."""
+    if not schedule:
+        return int(default_blocks)
+    active = int(default_blocks)
+    for start_epoch, blocks in schedule:
+        if int(epoch) >= int(start_epoch):
+            active = int(blocks)
+        else:
+            break
+    return int(active)
+
+
 def _get_age_column(df):
     for col in ("AGE", "age_days", "final_age_days"):
         if col in df.columns:
             return col
     return None
+
+
+def resolve_ordinal_age_bins(train_df: pd.DataFrame, args):
+    """
+    Resolve ordered age bins for ordinal auxiliary loss from CLI or training data.
+
+    Returns a sorted list of unique age values (floats), or None when ordinal loss is disabled.
+    """
+    if not bool(getattr(args, "ordinal_aux", False)):
+        return None
+    if float(getattr(args, "ordinal_aux_weight", 0.0) or 0.0) <= 0:
+        print("[ORD] --ordinal-aux enabled but --ordinal-aux-weight <= 0; disabling ordinal auxiliary loss.")
+        args.ordinal_aux = False
+        return None
+    if not bool(getattr(args, "mil_attention", False)):
+        print("[ORD] Ordinal auxiliary loss is currently implemented for --mil-attention only; disabling.")
+        args.ordinal_aux = False
+        return None
+
+    manual_bins = getattr(args, "ordinal_bin_values", None)
+    if manual_bins:
+        vals = sorted({float(v) for v in manual_bins})
+    else:
+        age_col = _get_age_column(train_df)
+        if age_col is None or train_df is None or train_df.empty:
+            print("[ORD] Could not infer age bins from training data; disabling ordinal auxiliary loss.")
+            args.ordinal_aux = False
+            return None
+        age_series = pd.to_numeric(train_df[age_col], errors="coerce").dropna()
+        vals = sorted({float(v) for v in age_series.tolist()})
+
+    if len(vals) < 2:
+        print(f"[ORD] Need at least 2 distinct age bins, got {len(vals)}; disabling ordinal auxiliary loss.")
+        args.ordinal_aux = False
+        return None
+
+    return vals
 
 
 def filter_df_by_days(df: pd.DataFrame, days, label: str) -> pd.DataFrame:
@@ -174,6 +276,245 @@ def filter_df_by_days(df: pd.DataFrame, days, label: str) -> pd.DataFrame:
     kept_days = sorted(np.unique(day_arr[mask]).tolist()) if mask.any() else []
     print(f"[DATA] {label}: day filter {list(days)} -> {len(df)} to {len(out)} rows (days kept={kept_days})")
     return out
+
+
+def _derive_inter_eye_csv_path(pred_csv_path: Path) -> Path:
+    name = pred_csv_path.name
+    if "_results" in name:
+        return pred_csv_path.with_name(name.replace("_results", "_inter_eye_differences", 1))
+    return pred_csv_path.with_name(pred_csv_path.stem + "_inter_eye_differences.csv")
+
+
+def build_inter_eye_pairs_csv(pred_csv_path: Path, out_csv_path: Path) -> Optional[pd.DataFrame]:
+    """
+    Build paired OD/OS inter-eye CSV from per-eye predictions (rat_id, eye, day rows).
+    """
+    if pred_csv_path is None or not pred_csv_path.exists():
+        print(f"[INTER-EYE] Skipping pair build (missing file): {pred_csv_path}")
+        return None
+    df = pd.read_csv(pred_csv_path)
+    required = {"rat_id", "eye", "day", "age_true", "age_pred"}
+    missing = required - set(df.columns)
+    if missing:
+        print(f"[INTER-EYE] Skipping pair build for {pred_csv_path.name}; missing columns: {sorted(missing)}")
+        return None
+    if df.empty:
+        print(f"[INTER-EYE] Skipping pair build for {pred_csv_path.name}; CSV empty.")
+        return None
+
+    df = df.copy()
+    df["eye"] = df["eye"].astype(str).str.upper().str.strip()
+    df = df[df["eye"].isin(["OD", "OS"])].copy()
+    if df.empty:
+        print(f"[INTER-EYE] Skipping pair build for {pred_csv_path.name}; no OD/OS rows.")
+        return None
+
+    agg_cols = {"age_true": "mean", "age_pred": "mean"}
+    for c in ("group", "sex", "cohort", "RAG"):
+        if c in df.columns:
+            agg_cols[c] = "first"
+    for c in ("mil_bag_n_kept", "mil_bag_n_raw", "mil_bag_n_qc_dropped"):
+        if c in df.columns:
+            agg_cols[c] = "mean"
+    if "mil_low_conf_bag" in df.columns:
+        agg_cols["mil_low_conf_bag"] = "max"
+
+    df_eye = df.groupby(["rat_id", "eye", "day"], as_index=False).agg(agg_cols)
+    # If RAG is not present, derive it.
+    if "RAG" not in df_eye.columns:
+        df_eye["RAG"] = pd.to_numeric(df_eye["age_pred"], errors="coerce") - pd.to_numeric(df_eye["age_true"], errors="coerce")
+
+    # Pivot each field separately to avoid fragile mixed-column pivots.
+    pair = None
+    pivot_fields = [c for c in df_eye.columns if c not in ["rat_id", "eye", "day"]]
+    for c in pivot_fields:
+        p = df_eye.pivot_table(index=["rat_id", "day"], columns="eye", values=c, aggfunc="first")
+        if not {"OD", "OS"} <= set(p.columns):
+            # keep partial; final dropna will remove incomplete pairs
+            pass
+        p = p.rename(columns={"OD": f"{c}_OD", "OS": f"{c}_OS"}).reset_index()
+        pair = p if pair is None else pair.merge(p, on=["rat_id", "day"], how="outer")
+
+    if pair is None or pair.empty:
+        print(f"[INTER-EYE] No pair rows created for {pred_csv_path.name}")
+        return None
+
+    # Keep complete OD/OS prediction pairs only.
+    if {"age_pred_OD", "age_pred_OS"} <= set(pair.columns):
+        pair = pair.dropna(subset=["age_pred_OD", "age_pred_OS"]).copy()
+    else:
+        print(f"[INTER-EYE] Missing paired age_pred columns for {pred_csv_path.name}")
+        return None
+
+    # Harmonize shared fields.
+    for base in ("cohort", "group", "sex"):
+        od = f"{base}_OD"
+        os_ = f"{base}_OS"
+        if od in pair.columns and os_ in pair.columns:
+            pair[base] = pair[od].where(pair[od].notna(), pair[os_])
+
+    pair["age_pred_inter_eye_signed_OD_minus_OS"] = pd.to_numeric(pair["age_pred_OD"], errors="coerce") - pd.to_numeric(pair["age_pred_OS"], errors="coerce")
+    pair["age_pred_inter_eye_abs"] = pair["age_pred_inter_eye_signed_OD_minus_OS"].abs()
+    if {"RAG_OD", "RAG_OS"} <= set(pair.columns):
+        pair["RAG_inter_eye_signed_OD_minus_OS"] = pd.to_numeric(pair["RAG_OD"], errors="coerce") - pd.to_numeric(pair["RAG_OS"], errors="coerce")
+        pair["RAG_inter_eye_abs"] = pair["RAG_inter_eye_signed_OD_minus_OS"].abs()
+
+    if {"mil_bag_n_kept_OD", "mil_bag_n_kept_OS"} <= set(pair.columns):
+        pair["mil_min_bag_n_kept"] = pd.concat(
+            [pd.to_numeric(pair["mil_bag_n_kept_OD"], errors="coerce"), pd.to_numeric(pair["mil_bag_n_kept_OS"], errors="coerce")],
+            axis=1,
+        ).min(axis=1)
+    if {"mil_low_conf_bag_OD", "mil_low_conf_bag_OS"} <= set(pair.columns):
+        pair["mil_pair_low_conf_any"] = (
+            pair["mil_low_conf_bag_OD"].fillna(False).astype(bool) |
+            pair["mil_low_conf_bag_OS"].fillna(False).astype(bool)
+        )
+
+    # Stable sort.
+    try:
+        pair["day"] = pd.to_numeric(pair["day"], errors="coerce")
+    except Exception:
+        pass
+    pair = pair.sort_values(["rat_id", "day"], kind="stable").reset_index(drop=True)
+
+    out_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    pair.to_csv(out_csv_path, index=False)
+    print(f"[INTER-EYE] Saved paired OD/OS CSV: {out_csv_path} (N={len(pair)})")
+    return pair
+
+
+def compute_inter_eye_thresholds_from_control(control_pair_df: pd.DataFrame, q95: float = 0.95, q99: float = 0.99) -> Optional[dict]:
+    if control_pair_df is None or control_pair_df.empty or "age_pred_inter_eye_abs" not in control_pair_df.columns:
+        return None
+    vals = pd.to_numeric(control_pair_df["age_pred_inter_eye_abs"], errors="coerce").dropna().astype(float)
+    if vals.empty:
+        return None
+    return {
+        "metric_col": "age_pred_inter_eye_abs",
+        "q95": float(q95),
+        "q99": float(q99),
+        "thresh_q95": float(vals.quantile(q95)),
+        "thresh_q99": float(vals.quantile(q99)),
+        "n_control_pairs": int(len(vals)),
+        "control_mean": float(vals.mean()),
+        "control_median": float(vals.median()),
+        "control_max": float(vals.max()),
+    }
+
+
+def annotate_inter_eye_reliability_flags(pair_df: pd.DataFrame, thresholds: Optional[dict]) -> pd.DataFrame:
+    if pair_df is None or pair_df.empty or not thresholds:
+        return pair_df
+    out = pair_df.copy()
+    metric_col = str(thresholds.get("metric_col", "age_pred_inter_eye_abs"))
+    if metric_col not in out.columns:
+        return out
+    vals = pd.to_numeric(out[metric_col], errors="coerce")
+    q95_th = float(thresholds["thresh_q95"])
+    q99_th = float(thresholds["thresh_q99"])
+    out["inter_eye_thresh_q95"] = q95_th
+    out["inter_eye_thresh_q99"] = q99_th
+    out["inter_eye_flag_unreliable_q95"] = vals > q95_th
+    out["inter_eye_flag_extreme_q99"] = vals > q99_th
+    tier = np.where(vals > q99_th, "extreme", np.where(vals > q95_th, "unreliable", "ok")).astype(object)
+    tier[pd.isna(vals)] = "unknown"
+    out["inter_eye_reliability_tier"] = tier
+    return out
+
+
+def run_post_control_inter_eye_analysis(args, control_pred_csv_path: Optional[Path], stress_pred_csv_path: Optional[Path]):
+    """
+    Optional post-step:
+    - Build paired inter-eye CSVs from per-eye prediction CSVs
+    - Add control-derived q95/q99 flags to paired CSVs
+    - For MIL runs, optionally run matched-view control re-inference utility
+    """
+    if not bool(getattr(args, "post_control_inter_eye_analysis", False)):
+        return
+    if control_pred_csv_path is None or not Path(control_pred_csv_path).exists():
+        print("[INTER-EYE] Post analysis skipped: control prediction CSV not available.")
+        return
+
+    control_pred_csv_path = Path(control_pred_csv_path)
+    control_pair_path = _derive_inter_eye_csv_path(control_pred_csv_path)
+    control_pair_df = build_inter_eye_pairs_csv(control_pred_csv_path, control_pair_path)
+    thresholds = compute_inter_eye_thresholds_from_control(
+        control_pair_df,
+        q95=float(getattr(args, "post_inter_eye_q95", 0.95)),
+        q99=float(getattr(args, "post_inter_eye_q99", 0.99)),
+    )
+    if thresholds and control_pair_df is not None:
+        control_pair_df = annotate_inter_eye_reliability_flags(control_pair_df, thresholds)
+        control_pair_df.to_csv(control_pair_path, index=False)
+        print(
+            "[INTER-EYE] Control thresholds "
+            f"q95={thresholds['thresh_q95']:.2f}, q99={thresholds['thresh_q99']:.2f} "
+            f"(N={thresholds['n_control_pairs']})"
+        )
+        thresh_json = control_pair_path.with_name(control_pair_path.stem + "_thresholds.json")
+        with thresh_json.open("w") as f:
+            json.dump(thresholds, f, indent=2)
+        print(f"[INTER-EYE] Saved control thresholds: {thresh_json}")
+
+    if stress_pred_csv_path is not None and Path(stress_pred_csv_path).exists():
+        stress_pred_csv_path = Path(stress_pred_csv_path)
+        stress_pair_path = _derive_inter_eye_csv_path(stress_pred_csv_path)
+        stress_pair_df = build_inter_eye_pairs_csv(stress_pred_csv_path, stress_pair_path)
+        if thresholds and stress_pair_df is not None:
+            stress_pair_df = annotate_inter_eye_reliability_flags(stress_pair_df, thresholds)
+            stress_pair_df.to_csv(stress_pair_path, index=False)
+            n_unrel = int(stress_pair_df["inter_eye_flag_unreliable_q95"].fillna(False).astype(bool).sum()) if "inter_eye_flag_unreliable_q95" in stress_pair_df.columns else 0
+            print(f"[INTER-EYE] Annotated stress paired CSV with control thresholds ({n_unrel}/{len(stress_pair_df)} q95-unreliable).")
+
+    # Control matched-view MIL re-inference (analysis only)
+    if not bool(getattr(args, "mil_attention", False)):
+        return
+    if not bool(getattr(args, "post_control_matched_view", False)):
+        return
+
+    ckpt_for_post = None
+    if getattr(args, "load_lora", None) and Path(args.load_lora).exists():
+        ckpt_for_post = Path(args.load_lora)
+    elif getattr(args, "save_lora", None) and Path(args.save_lora).exists():
+        ckpt_for_post = Path(args.save_lora)
+    if ckpt_for_post is None:
+        print("[INTER-EYE] Matched-view control analysis skipped: no checkpoint available (load/save_lora missing).")
+        return
+    if control_pair_df is None or control_pair_df.empty:
+        print("[INTER-EYE] Matched-view control analysis skipped: no paired control CSV rows.")
+        return
+
+    cmd = [
+        sys.executable,
+        str(LORA_DIR / "control_matched_view_infer.py"),
+        "--pair-csv", str(control_pair_path),
+        "--load-lora", str(ckpt_for_post),
+        "--csv", str(args.csv),
+        "--backbone-ckpt", str(args.backbone_ckpt),
+        "--device", str(args.device),
+        "--img-size", str(int(args.img_size)),
+        "--upsample-factor", str(int(args.upsample_factor)),
+        "--lora-rank", str(int(args.lora_rank)),
+        "--lora-alpha", str(float(args.lora_alpha)),
+        "--lora-blocks", str(int(args.lora_blocks)),
+        "--lora-dropout", str(float(args.lora_dropout)),
+        "--mil-attn-dim", str(int(args.mil_attn_dim)),
+        "--mil-hidden-dim", str(int(args.mil_hidden_dim)),
+        "--min-common-images", str(int(getattr(args, "post_control_matched_view_min_common_images", 1))),
+        "--q95", str(float(getattr(args, "post_inter_eye_q95", 0.95))),
+        "--q99", str(float(getattr(args, "post_inter_eye_q99", 0.99))),
+    ]
+    if bool(getattr(args, "keep_spatial_tokens", False)):
+        cmd.append("--keep-spatial-tokens")
+    if bool(getattr(args, "input_pre_adapter", False)):
+        cmd.extend(["--input-pre-adapter", "--input-pre-adapter-hidden", str(int(args.input_pre_adapter_hidden))])
+    if bool(getattr(args, "post_control_matched_view_canonicalize_os", False)):
+        cmd.append("--canonicalize-os-to-od")
+    try:
+        print("[INTER-EYE] Running control matched-view MIL analysis...")
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        print(f"[INTER-EYE] Matched-view control analysis failed: {e}")
 
 
 def check_split_health(train_df, val_df, test_df, ctrl_df):
@@ -258,6 +599,13 @@ def parse_args():
     p.add_argument("--test-image-types", type=str, nargs="*", default=None, help="Override image types for test/ctrl_test loaders (e.g., REGAVG)")
     p.add_argument("--test-single-image", action="store_true", help="Deduplicate test/ctrl_test to one image per rat/eye/day")
     p.add_argument(
+        "--cohorts",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Override cohorts to keep (e.g., --cohorts 1 2). Default uses config COHORTS_TO_KEEP.",
+    )
+    p.add_argument(
         "--day-whitelist",
         type=int,
         nargs="*",
@@ -297,6 +645,16 @@ def parse_args():
     p.add_argument("--lora-rank", type=int, default=LORA_RANK,
                    help="LoRA rank (suggested: 4, 8, 16, 32)")
     p.add_argument("--lora-blocks", type=int, default=LORA_BLOCKS)
+    p.add_argument(
+        "--progressive-lora-schedule",
+        type=str,
+        default=None,
+        help=(
+            "Progressively open LoRA blocks during training, format 'blocks:start_epoch,...' "
+            "(e.g. '2:0,4:6,6:12'; 0-based or 1-based starts accepted). "
+            "Model is built with max(args.lora_blocks, max schedule blocks)."
+        ),
+    )
     p.add_argument("--lora-alpha", type=float, default=LORA_ALPHA,
                    help="LoRA alpha (suggested: 16, 32, 64; often ~2x rank)")
     p.add_argument("--lora-dropout", type=float, default=LORA_DROPOUT,
@@ -312,8 +670,79 @@ def parse_args():
         action="store_true",
         help="Use attention-MIL over all images in each (rat_id, eye, day) case (disables fusion modes).",
     )
+    p.set_defaults(mil_freeze_backbone=True)
+    p.add_argument(
+        "--mil-freeze-backbone",
+        action="store_true",
+        dest="mil_freeze_backbone",
+        help="Freeze RETFound backbone in MIL mode (default: on; forces --lora-blocks 0).",
+    )
+    p.add_argument(
+        "--no-mil-freeze-backbone",
+        action="store_false",
+        dest="mil_freeze_backbone",
+        help="Allow LoRA adaptation in MIL mode (use with a small --lora-blocks, e.g. 2 or 4).",
+    )
     p.add_argument("--mil-attn-dim", type=int, default=128, help="Hidden dim for MIL attention scorer.")
     p.add_argument("--mil-hidden-dim", type=int, default=256, help="Hidden dim for MIL regression MLP.")
+    p.add_argument(
+        "--heteroscedastic-regression",
+        action="store_true",
+        help="MIL-only: predict (mu, log_var) and train with Gaussian NLL (heteroscedastic regression).",
+    )
+    p.add_argument(
+        "--hetero-logvar-reg-weight",
+        type=float,
+        default=1e-2,
+        help="L2 regularization weight on heteroscedastic log_var (z-space) to reduce variance inflation/collapse (default: 1e-2).",
+    )
+    p.add_argument("--mil-view-balance", action="store_true",
+                   help="Train-time MIL view-balanced bag sampling (cap instances per coarse view family).")
+    p.add_argument("--mil-max-per-view", type=int, default=0,
+                   help="Per-view cap for MIL train bags when --mil-view-balance is enabled (0 disables cap).")
+    p.add_argument("--mil-bag-quality-filter", action="store_true",
+                   help="Apply simple image-quality heuristics before MIL bag assembly (train+eval).")
+    p.add_argument("--mil-min-bag-size", type=int, default=0,
+                   help="Drop MIL bags with fewer than this many usable images after filtering (0 disables).")
+    p.add_argument("--mil-infer-lowconf-bag-size", type=int, default=0,
+                   help="Flag MIL predictions with kept bag size below this threshold in prediction CSVs (0 disables).")
+    p.add_argument(
+        "--ordinal-aux",
+        action="store_true",
+        help="Add ordinal auxiliary loss (CORAL-style) on top of MIL pooled features using age bins.",
+    )
+    p.add_argument(
+        "--ordinal-aux-weight",
+        type=float,
+        default=0.1,
+        help="Weight for ordinal auxiliary loss when --ordinal-aux is enabled (default: 0.1).",
+    )
+    p.add_argument(
+        "--ordinal-bin-values",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Optional explicit age bins for ordinal auxiliary loss (sorted unique values are used). Default: infer from train split ages.",
+    )
+    p.add_argument(
+        "--ordinal-aux-hidden-dim",
+        type=int,
+        default=0,
+        help="Hidden dim for ordinal auxiliary head MLP (0 => reuse regression head hidden dim).",
+    )
+    p.add_argument(
+        "--mil-control-inter-eye-lambda",
+        type=float,
+        default=0.0,
+        help="Weight for MIL control-only inter-eye consistency regularizer |pred_OD-pred_OS| within batch (default: 0 disables).",
+    )
+    p.add_argument(
+        "--mil-control-inter-eye-loss",
+        type=str,
+        default="l1",
+        choices=["l1", "smoothl1"],
+        help="Penalty type for MIL control inter-eye consistency regularizer.",
+    )
     p.add_argument(
         "--input-pre-adapter",
         action="store_true",
@@ -375,8 +804,8 @@ def parse_args():
                    help="(Deprecated) Skew disabled; Smooth L1 only")
     p.add_argument("--skew-age-median", type=float, default=None,
                    help="(Deprecated) Skew disabled; Smooth L1 only")
-    p.add_argument("--aug-level", type=str, default=AUG_LEVEL, choices=["low", "medium", "high"],
-                   help="Augmentation strength for training transforms")
+    p.add_argument("--aug-level", type=str, default=AUG_LEVEL, choices=["mild", "low", "medium", "high"],
+                   help="Augmentation strength for training transforms (mild aliases low)")
     p.add_argument(
         "--no-photometric-aug",
         action="store_true",
@@ -409,6 +838,39 @@ def parse_args():
                    help="Optional dir to save saliency heatmaps (one PNG per image)")
     p.add_argument("--save-report-dir", type=Path, default=None,
                    help="Optional dir to save data stats, train curves, and val prediction plots/tables")
+    p.add_argument(
+        "--post-control-inter-eye-analysis",
+        action="store_true",
+        help="After prediction export, build paired inter-eye CSVs, add control-derived q95/q99 flags, and (MIL) run matched-view control analysis.",
+    )
+    p.add_argument(
+        "--post-control-matched-view",
+        action="store_true",
+        help="With --post-control-inter-eye-analysis and --mil-attention, run matched-view control re-inference analysis.",
+    )
+    p.add_argument(
+        "--post-control-matched-view-min-common-images",
+        type=int,
+        default=1,
+        help="Minimum matched shared images per eye required for control matched-view re-inference (analysis only).",
+    )
+    p.add_argument(
+        "--post-control-matched-view-canonicalize-os",
+        action="store_true",
+        help="Mirror OS images during control matched-view analysis (analysis only).",
+    )
+    p.add_argument(
+        "--post-inter-eye-q95",
+        type=float,
+        default=0.95,
+        help="Quantile for control-derived inter-eye 'unreliable' flag in paired CSVs (default: 0.95).",
+    )
+    p.add_argument(
+        "--post-inter-eye-q99",
+        type=float,
+        default=0.99,
+        help="Quantile for control-derived inter-eye 'extreme' flag in paired CSVs (default: 0.99).",
+    )
     p.add_argument("--run-auroc-report", action="store_true",
                    help="After prediction, run eval_suite_retfound AUROC with --control-day-anchor --show-delta")
     # Cross-validation
@@ -443,6 +905,8 @@ def build_model(args):
             print("[MODEL] Using CLS-only RETFound features for age regression (spatial tokens disabled).")
         if args.mil_attention:
             print(f"[MODEL] Attention-MIL enabled (attn_dim={args.mil_attn_dim}, hidden_dim={args.mil_hidden_dim})")
+        if args.mil_attention and getattr(args, "heteroscedastic_regression", False):
+            print("[MODEL] Heteroscedastic regression enabled (mu + log_var, Gaussian NLL).")
         if args.input_pre_adapter:
             print(f"[MODEL] Input pre-adapter enabled (hidden={args.input_pre_adapter_hidden})")
         model = RETFoundLoRAAgePred(
@@ -460,6 +924,9 @@ def build_model(args):
             use_mil_attention=args.mil_attention,
             mil_attn_dim=args.mil_attn_dim,
             mil_hidden_dim=args.mil_hidden_dim,
+            heteroscedastic_regression=bool(getattr(args, "heteroscedastic_regression", False)),
+            ordinal_num_bins=int(getattr(args, "ordinal_num_bins", 0) or 0),
+            ordinal_aux_hidden_dim=int(getattr(args, "ordinal_aux_hidden_dim", 0) or 0),
     )
     return model
 
@@ -478,9 +945,35 @@ def run_fold(args):
         args.aggregate_features = False
         args.late_fusion = False
         args.aggregate_by_rat = False
-        if args.model_type == "retfound" and args.lora_blocks != 0:
-            print(f"[MIL] Freezing RETFound backbone in MIL baseline: forcing --lora-blocks 0 (was {args.lora_blocks}).")
-            args.lora_blocks = 0
+        if getattr(args, "mil_freeze_backbone", True):
+            if args.model_type == "retfound" and args.lora_blocks != 0:
+                print(f"[MIL] Freezing RETFound backbone in MIL baseline: forcing --lora-blocks 0 (was {args.lora_blocks}).")
+                args.lora_blocks = 0
+            else:
+                print("[MIL] Freezing RETFound backbone in MIL baseline (--mil-freeze-backbone).")
+        else:
+            if args.lora_blocks > 0:
+                print(f"[MIL] Allowing LoRA adaptation in MIL mode with --lora-blocks {args.lora_blocks}.")
+            else:
+                print("[MIL] --no-mil-freeze-backbone set, but --lora-blocks=0 so RETFound remains effectively frozen.")
+
+    progressive_lora_schedule = None
+    if getattr(args, "progressive_lora_schedule", None):
+        if args.model_type != "retfound":
+            raise SystemExit("--progressive-lora-schedule is supported only with --model-type retfound.")
+        try:
+            progressive_lora_schedule = parse_progressive_lora_schedule(args.progressive_lora_schedule)
+        except Exception as e:
+            raise SystemExit(f"Invalid --progressive-lora-schedule: {e}")
+        if progressive_lora_schedule:
+            max_sched_blocks = max(int(b) for _, b in progressive_lora_schedule)
+            if max_sched_blocks > int(args.lora_blocks):
+                print(
+                    f"[LoRA] Increasing --lora-blocks from {args.lora_blocks} to {max_sched_blocks} "
+                    "to satisfy --progressive-lora-schedule."
+                )
+                args.lora_blocks = int(max_sched_blocks)
+            print(f"[LoRA] Progressive schedule (epoch->active_blocks): {progressive_lora_schedule}")
 
     device = torch.device(args.device)
     print(f"[DEVICE] requested={args.device} | torch.cuda.is_available()={torch.cuda.is_available()} | using={device}")
@@ -488,7 +981,30 @@ def run_fold(args):
         print("[WARN] CUDA device requested but torch.cuda.is_available() is False. Check driver/NVML access (see torch.version.cuda).")
         print("[WARN] Falling back to CPU; training will be slow.")
     print(f"[DATA] day_whitelist={'ALL' if args.day_whitelist is None else args.day_whitelist}")
+    print(f"[DATA] cohorts_to_keep={args.cohorts if args.cohorts is not None else COHORTS_TO_KEEP}")
     print(f"[AUG] photometric_aug={'OFF' if args.no_photometric_aug else 'ON'} | aug_level={args.aug_level}")
+    if getattr(args, "mil_attention", False):
+        print(
+            "[MIL] bag_qc: "
+            f"quality_filter={'ON' if bool(getattr(args, 'mil_bag_quality_filter', False)) else 'OFF'} | "
+            f"view_balance={'ON' if bool(getattr(args, 'mil_view_balance', False)) else 'OFF'} | "
+            f"max_per_view={int(getattr(args, 'mil_max_per_view', 0) or 0)} | "
+            f"min_bag_size={int(getattr(args, 'mil_min_bag_size', 0) or 0)} | "
+            f"infer_lowconf_bag_size={int(getattr(args, 'mil_infer_lowconf_bag_size', 0) or 0)}"
+        )
+        if bool(getattr(args, "heteroscedastic_regression", False)):
+            print("[MIL] heteroscedastic regression: ON (train loss = Gaussian NLL, eval metric loss remains SmoothL1)")
+    if getattr(args, "mil_attention", False) and float(getattr(args, "mil_control_inter_eye_lambda", 0.0)) > 0:
+        print(
+            "[MIL] control inter-eye consistency: "
+            f"lambda={float(args.mil_control_inter_eye_lambda):.4g}, "
+            f"loss={getattr(args, 'mil_control_inter_eye_loss', 'l1')}"
+        )
+    if bool(getattr(args, "ordinal_aux", False)):
+        print(
+            "[ORD] requested ordinal auxiliary loss: "
+            f"weight={float(getattr(args, 'ordinal_aux_weight', 0.0)):.4g}"
+        )
 
     use_folds = args.kfolds and args.kfolds > 1
     fold_suffix = f"_fold{args.fold_index}" if use_folds else ""
@@ -535,7 +1051,7 @@ def run_fold(args):
             test_image_types=args.test_image_types,
             test_single_image=args.test_single_image,
             include_recovery_days=False,
-            cohorts_to_keep=COHORTS_TO_KEEP,
+            cohorts_to_keep=(args.cohorts if args.cohorts is not None else COHORTS_TO_KEEP),
             exclude_recovery_paths=False,
             train_groups=args.train_groups,
             test_groups=args.test_groups,
@@ -555,6 +1071,10 @@ def run_fold(args):
             cohort_stratified_split=args.cohort_stratified_split,
             enable_photometric_aug=not args.no_photometric_aug,
             mil_attention=args.mil_attention,
+            mil_view_balance=args.mil_view_balance,
+            mil_max_per_view=args.mil_max_per_view,
+            mil_min_bag_size=args.mil_min_bag_size,
+            mil_quality_filter=args.mil_bag_quality_filter,
         )
         rat_ids = base_train_df["rat_id"].unique()
         rng = np.random.default_rng(args.fold_seed)
@@ -597,6 +1117,10 @@ def run_fold(args):
             aug_level=args.aug_level,
             enable_photometric_aug=not args.no_photometric_aug,
             mil_attention=args.mil_attention,
+            mil_view_balance=args.mil_view_balance,
+            mil_max_per_view=args.mil_max_per_view,
+            mil_min_bag_size=args.mil_min_bag_size,
+            mil_quality_filter=args.mil_bag_quality_filter,
         )
     else:
         train_df, val_df, ctrl_test_df, test_df, (train_loader, val_loader, test_loader, ctrl_test_loader) = prepare_data(
@@ -606,7 +1130,7 @@ def run_fold(args):
             test_image_types=args.test_image_types,
             test_single_image=args.test_single_image,
             include_recovery_days=False,
-            cohorts_to_keep=COHORTS_TO_KEEP,
+            cohorts_to_keep=(args.cohorts if args.cohorts is not None else COHORTS_TO_KEEP),
             exclude_recovery_paths=False,
             train_groups=args.train_groups,
             test_groups=args.test_groups,
@@ -626,6 +1150,10 @@ def run_fold(args):
             cohort_stratified_split=args.cohort_stratified_split,
             enable_photometric_aug=not args.no_photometric_aug,
             mil_attention=args.mil_attention,
+            mil_view_balance=args.mil_view_balance,
+            mil_max_per_view=args.mil_max_per_view,
+            mil_min_bag_size=args.mil_min_bag_size,
+            mil_quality_filter=args.mil_bag_quality_filter,
         )
 
     full_df = pd.concat([train_df, val_df, ctrl_test_df, test_df], ignore_index=True)
@@ -642,6 +1170,45 @@ def run_fold(args):
     print(f"[DATA] rats per group: {group_rat_counts.to_dict()}")
     print(f"[DATA] rats per cohort (including zeros): {cohort_rat_counts.to_dict()}")
     check_split_health(train_df, val_df, test_df, ctrl_test_df)
+
+    args.ordinal_bin_values_resolved = resolve_ordinal_age_bins(train_df, args)
+    args.ordinal_num_bins = len(args.ordinal_bin_values_resolved) if args.ordinal_bin_values_resolved else 0
+    if getattr(args, "ordinal_aux", False) and args.ordinal_num_bins >= 2:
+        bins_preview = args.ordinal_bin_values_resolved
+        if len(bins_preview) > 12:
+            preview_txt = f"{bins_preview[:6]} ... {bins_preview[-3:]}"
+        else:
+            preview_txt = str(bins_preview)
+        print(
+            "[ORD] active: "
+            f"num_bins={args.ordinal_num_bins}, weight={float(args.ordinal_aux_weight):.4g}, "
+            f"bins={preview_txt}"
+        )
+
+    if bool(getattr(args, "heteroscedastic_regression", False)):
+        # Normalize heteroscedastic MIL targets using the train-split bag-level age distribution.
+        # This keeps NLL numerically stable and makes the learned log_var operate in z-space.
+        if getattr(args, "mil_attention", False) and all(c in train_df.columns for c in ("rat_id", "eye", "day", "AGE")):
+            age_series = (
+                train_df.groupby(["rat_id", "eye", "day"], dropna=False)["AGE"]
+                .mean()
+                .astype(float)
+            )
+        elif "AGE" in train_df.columns:
+            age_series = train_df["AGE"].astype(float)
+        else:
+            age_series = pd.Series(dtype=float)
+        mean_age = float(age_series.mean()) if len(age_series) else 0.0
+        std_age = float(age_series.std(ddof=0)) if len(age_series) else 1.0
+        if (not np.isfinite(std_age)) or std_age <= 1e-6:
+            std_age = 1.0
+        args.hetero_target_mean = mean_age
+        args.hetero_target_std = std_age
+        print(
+            "[MIL][hetero] target z-score stats (train split): "
+            f"mean={mean_age:.3f}, std={std_age:.3f}, "
+            f"logvar_reg_weight={float(getattr(args, 'hetero_logvar_reg_weight', 0.0)):.4g}"
+        )
 
     if report_dir:
         data_stats = {
@@ -678,6 +1245,10 @@ def run_fold(args):
                 aug_level=args.aug_level,
                 enable_photometric_aug=not args.no_photometric_aug,
                 mil_attention=args.mil_attention,
+                mil_view_balance=args.mil_view_balance,
+                mil_max_per_view=args.mil_max_per_view,
+                mil_min_bag_size=args.mil_min_bag_size,
+                mil_quality_filter=args.mil_bag_quality_filter,
             )
             return val_like_loader
 
@@ -687,6 +1258,9 @@ def run_fold(args):
         control_val_fallback_loader = _build_eval_loader_from_df(val_ctrl_eval_df)
 
     model = build_model(args).to(device)
+    if bool(getattr(args, "heteroscedastic_regression", False)):
+        setattr(model, "hetero_target_mean", float(getattr(args, "hetero_target_mean", 0.0) or 0.0))
+        setattr(model, "hetero_target_std", float(getattr(args, "hetero_target_std", 1.0) or 1.0))
     trainer = Trainer(model, device)
 
     correction = None
@@ -701,6 +1275,19 @@ def run_fold(args):
     if load_path and load_path.exists():
         ckpt = torch.load(load_path, map_location="cpu")
         if isinstance(ckpt, dict) and "backbone_lora" in ckpt:
+            if bool(getattr(args, "heteroscedastic_regression", False)) and isinstance(ckpt.get("hetero_target_norm"), dict):
+                norm = ckpt.get("hetero_target_norm") or {}
+                try:
+                    args.hetero_target_mean = float(norm.get("mean", getattr(args, "hetero_target_mean", 0.0)))
+                    args.hetero_target_std = float(norm.get("std", getattr(args, "hetero_target_std", 1.0)))
+                    setattr(model, "hetero_target_mean", float(args.hetero_target_mean))
+                    setattr(model, "hetero_target_std", float(args.hetero_target_std))
+                    print(
+                        "[LOAD] Loaded heteroscedastic target norm from checkpoint: "
+                        f"mean={args.hetero_target_mean:.3f}, std={args.hetero_target_std:.3f}"
+                    )
+                except Exception:
+                    print("[LOAD] Warning: invalid hetero_target_norm in checkpoint; using current run split stats.")
             # Put LoRA layers in unmerged mode before loading A/B deltas.
             if args.model_type == "retfound":
                 model.backbone.train()
@@ -718,6 +1305,11 @@ def run_fold(args):
                     model.mil_head.load_state_dict(ckpt["mil_head"], strict=False)
                 else:
                     print("[LOAD] Checkpoint missing mil_head weights (MIL enabled in current model).")
+            if args.model_type == "retfound" and hasattr(model, "ordinal_head") and model.ordinal_head is not None:
+                if "ordinal_head" in ckpt:
+                    model.ordinal_head.load_state_dict(ckpt["ordinal_head"], strict=False)
+                else:
+                    print("[LOAD] Checkpoint missing ordinal_head weights (ordinal aux enabled in current model).")
             if "head" in ckpt:
                 model.head.load_state_dict(ckpt["head"], strict=False)
             if "correction" in ckpt and (args.bias_correction or args.use_saved_correction):
@@ -753,8 +1345,15 @@ def run_fold(args):
         )
         patience_counter = 0
         early_stop_patience = args.early_stop_patience
+        current_active_lora_blocks = None
 
         for epoch in range(1, args.epochs + 1):
+            if progressive_lora_schedule and hasattr(model, "set_active_lora_blocks"):
+                target_active = active_lora_blocks_for_epoch(epoch, progressive_lora_schedule, args.lora_blocks)
+                if current_active_lora_blocks != int(target_active):
+                    applied = int(model.set_active_lora_blocks(int(target_active)))
+                    current_active_lora_blocks = applied
+                    print(f"[LoRA] Epoch {epoch}: active_lora_blocks={applied}")
             train_loss = trainer.train_one_epoch(train_loader, optimizer, args) if train_loader else float("nan")
             val_loss = trainer.evaluate(val_loader, args) if val_loader else float("nan")
             current_lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else float("nan")
@@ -763,8 +1362,10 @@ def run_fold(args):
                 "train_L1": float(train_loss),
                 "val_L1": float(val_loss),
                 "lr": float(current_lr),
+                "active_lora_blocks": float(current_active_lora_blocks) if current_active_lora_blocks is not None else float(args.lora_blocks),
             })
-            print(f"[EPOCH {epoch}] train_L1={train_loss:.4f} val_L1={val_loss:.4f}")
+            train_metric_name = "train_NLL" if bool(getattr(args, "heteroscedastic_regression", False)) else "train_L1"
+            print(f"[EPOCH {epoch}] {train_metric_name}={train_loss:.4f} val_L1={val_loss:.4f}")
             if val_loader and not np.isnan(val_loss):
                 scheduler.step(val_loss)
             if val_loader and not np.isnan(val_loss) and val_loss < best_val:
@@ -847,6 +1448,15 @@ def run_fold(args):
                 save_dict["pre_adapter"] = model.pre_adapter.state_dict()
             if hasattr(model, "mil_head") and model.mil_head is not None:
                 save_dict["mil_head"] = model.mil_head.state_dict()
+            if hasattr(model, "ordinal_head") and model.ordinal_head is not None:
+                save_dict["ordinal_head"] = model.ordinal_head.state_dict()
+                if getattr(args, "ordinal_bin_values_resolved", None):
+                    save_dict["ordinal_bin_values"] = [float(v) for v in args.ordinal_bin_values_resolved]
+            if bool(getattr(args, "heteroscedastic_regression", False)):
+                save_dict["hetero_target_norm"] = {
+                    "mean": float(getattr(args, "hetero_target_mean", 0.0) or 0.0),
+                    "std": float(getattr(args, "hetero_target_std", 1.0) or 1.0),
+                }
         else:
             # Baseline path keeps full backbone weights for compatibility.
             save_dict = {
@@ -904,11 +1514,18 @@ def run_fold(args):
         correction=correction,
         save_saliency_dir=args.save_saliency_dir if args.save_saliency_dir else None,
     )
+    stress_csv_path = pred_dir / stress_csv_name
+
+    # Optional control-first inter-eye post analysis (paired CSVs + reliability flags + matched-view MIL analysis).
+    try:
+        run_post_control_inter_eye_analysis(args, control_csv_path, stress_csv_path)
+    except Exception as e:
+        print(f"[INTER-EYE] Post analysis failed: {e}")
 
     if report_dir:
         metrics = []
         ctrl_path = control_csv_path or (pred_dir / f"control_test_results{full_suffix}.csv")
-        stress_path = pred_dir / stress_csv_name
+        stress_path = stress_csv_path
         for label, p in (("control", ctrl_path), ("stress", stress_path)):
             m = compute_metrics_csv(p)
             if m:

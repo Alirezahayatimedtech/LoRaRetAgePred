@@ -386,6 +386,9 @@ def make_transform(
     robust_intensity_norm = RobustIntensityNormalize(enabled=True, p_low=1.0, p_high=99.0)
 
     level = str(aug_level).strip().lower()
+    if level == "mild":
+        # Alias "mild" to the current low-augmentation profile.
+        level = "low"
     aug_params = {
         "low": {
             "rot": 5,
@@ -502,6 +505,8 @@ def collate_bag_batch(batch):
     out = {
         "bags": [b["images"] for b in batch],
         "bag_sizes": torch.as_tensor([int(b["images"].shape[0]) for b in batch], dtype=torch.long),
+        "bag_sizes_raw": torch.as_tensor([int(b.get("raw_bag_size", b["images"].shape[0])) for b in batch], dtype=torch.long),
+        "bag_qc_dropped": torch.as_tensor([int(b.get("qc_dropped_count", 0)) for b in batch], dtype=torch.long),
         "day": torch.as_tensor([float(b["day"]) for b in batch], dtype=torch.float32),
         "age_days": torch.as_tensor([float(b["age_days"]) for b in batch], dtype=torch.float32),
         "group": [b["group"] for b in batch],
@@ -512,6 +517,44 @@ def collate_bag_batch(batch):
         "paths": [b.get("paths", []) for b in batch],
     }
     return out
+
+
+def _mil_view_group_from_row(row) -> str:
+    """
+    Derive a coarse-but-useful view key for MIL balancing from the image filename.
+
+    Examples:
+    - `..._L_2_0_BScanThumb...`   -> `L_2`
+    - `..._LS_3_0_BScanThumb...`  -> `LS_3`
+    - `..._V_3x3_0_BScanThumb...` -> `V_3X3`
+    - `..._REGAVG000001...`       -> `REGAVG`
+    """
+    try:
+        stem = Path(str(row.get("image_path", ""))).stem.upper()
+    except Exception:
+        stem = ""
+    if not stem:
+        stem = str(row.get("image_type", "UNKNOWN")).strip().upper()
+
+    parts = [p for p in stem.split("_") if p]
+    # Common format starts with RATID_EYE_...
+    tail = "_".join(parts[2:]) if len(parts) >= 3 else stem
+
+    if "REGAVG" in tail:
+        return "REGAVG"
+    if tail.startswith("V_3X3"):
+        return "V_3X3"
+    if tail.startswith("V_1X1"):
+        return "V_1X1"
+
+    m = re.match(r"^(LS|L|R)_(\d+)", tail)
+    if m:
+        return f"{m.group(1)}_{m.group(2)}"
+
+    # Fallback to the first token after rat/eye prefixes.
+    if tail:
+        return tail.split("_")[0]
+    return "UNKNOWN"
 
 
 class AgeImageDataset(Dataset):
@@ -564,6 +607,12 @@ class AgeBagDataset(Dataset):
         transform: T.Compose,
         bag_keys=("rat_id", "eye", "day"),
         skip_broken: bool = True,
+        train_mode: bool = False,
+        view_balance: bool = False,
+        max_per_view: int = 0,
+        min_bag_size: int = 0,
+        quality_filter: bool = False,
+        dataset_name: str = "mil",
     ):
         super().__init__()
         self.df = df.reset_index(drop=True)
@@ -571,6 +620,13 @@ class AgeBagDataset(Dataset):
         self.skip_broken = skip_broken
         self.bag_keys = tuple(bag_keys)
         self.canonicalize_os_to_od = False
+        self.train_mode = bool(train_mode)
+        self.view_balance = bool(view_balance) and self.train_mode
+        self.max_per_view = int(max(0, max_per_view))
+        self.min_bag_size = int(max(0, min_bag_size))
+        self.quality_filter = bool(quality_filter)
+        self.dataset_name = str(dataset_name)
+        self._view_key_cache = {}
 
         if self.df.empty:
             self.groups = []
@@ -578,22 +634,136 @@ class AgeBagDataset(Dataset):
 
         grouped = self.df.groupby(list(self.bag_keys), sort=False)
         self.groups = []
+        total_groups = 0
+        dropped_small = 0
+        raw_sizes = []
+        eff_sizes = []
         for key, grp in grouped:
+            total_groups += 1
             rows = grp.index.to_list()
             if not rows:
                 continue
+            raw_n = len(rows)
+            eff_n = self._effective_bag_size(rows)
+            raw_sizes.append(raw_n)
+            eff_sizes.append(eff_n)
+            if self.min_bag_size > 0 and eff_n < self.min_bag_size:
+                dropped_small += 1
+                continue
             self.groups.append((key, rows))
+
+        if total_groups:
+            raw_mean = float(np.mean(raw_sizes)) if raw_sizes else 0.0
+            eff_mean = float(np.mean(eff_sizes)) if eff_sizes else 0.0
+            msg = (
+                f"[MIL][{self.dataset_name}] bags={len(self.groups)}/{total_groups} "
+                f"(dropped_small={dropped_small}) | raw_mean_n={raw_mean:.2f}"
+            )
+            if self.view_balance and self.max_per_view > 0:
+                msg += f" | view_balance=ON max_per_view={self.max_per_view} eff_mean_n={eff_mean:.2f}"
+            if self.min_bag_size > 0:
+                msg += f" | min_bag_size={self.min_bag_size}"
+            if self.quality_filter:
+                msg += " | quality_filter=ON"
+            print(msg)
 
     def __len__(self) -> int:
         return len(self.groups)
+
+    def _row_view_key(self, ridx: int) -> str:
+        key = self._view_key_cache.get(int(ridx))
+        if key is None:
+            row = self.df.iloc[int(ridx)]
+            key = _mil_view_group_from_row(row)
+            self._view_key_cache[int(ridx)] = key
+        return key
+
+    def _effective_bag_size(self, row_indices) -> int:
+        if not (self.view_balance and self.max_per_view > 0):
+            return int(len(row_indices))
+        counts = {}
+        for ridx in row_indices:
+            vk = self._row_view_key(int(ridx))
+            counts[vk] = counts.get(vk, 0) + 1
+        return int(sum(min(c, self.max_per_view) for c in counts.values()))
+
+    def _select_row_indices(self, row_indices):
+        if not (self.view_balance and self.max_per_view > 0):
+            return list(row_indices)
+        buckets = {}
+        for ridx in row_indices:
+            vk = self._row_view_key(int(ridx))
+            buckets.setdefault(vk, []).append(int(ridx))
+        selected = []
+        for idxs in buckets.values():
+            if len(idxs) <= self.max_per_view:
+                chosen = list(idxs)
+            else:
+                chosen = np.random.choice(np.asarray(idxs, dtype=int), size=self.max_per_view, replace=False).tolist()
+            selected.extend(int(i) for i in chosen)
+        if len(selected) > 1:
+            np.random.shuffle(selected)
+        return selected
+
+    @staticmethod
+    def _passes_quality_filter(im_rgb: Image.Image) -> bool:
+        """
+        Conservative OCT quality gate for MIL:
+        - reject near-empty/dark frames
+        - reject very low-contrast frames
+        - reject heavily saturated highlights
+        - reject severely blurry frames
+        """
+        arr = np.asarray(im_rgb.convert("L"), dtype=np.float32) / 255.0
+        if arr.size == 0:
+            return False
+
+        # Ignore pure background floor; OCTs have large black regions.
+        fg = arr > 0.02
+        fg_frac = float(fg.mean())
+        if fg_frac < 0.05:
+            return False
+        vals = arr[fg]
+        if vals.size < 32:
+            return False
+
+        mean = float(vals.mean())
+        std = float(vals.std())
+        hi_clip = float((vals >= 0.98).mean())
+        lo_clip = float((vals <= 0.03).mean())
+        if mean < 0.06:
+            return False
+        if std < 0.045:
+            return False
+        if hi_clip > 0.25:
+            return False
+        if lo_clip > 0.85:
+            return False
+
+        # Blur proxy: gradient energy inside the foreground bounding box.
+        ys, xs = np.where(fg)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        crop = arr[y0:y1, x0:x1]
+        if crop.size == 0 or min(crop.shape) < 8:
+            return False
+        dx = np.diff(crop, axis=1)
+        dy = np.diff(crop, axis=0)
+        grad_l1 = 0.5 * (float(np.mean(np.abs(dx))) + float(np.mean(np.abs(dy))))
+        if grad_l1 < 0.015:
+            return False
+        return True
 
     def __getitem__(self, idx: int):
         if idx < 0 or idx >= len(self.groups):
             raise IndexError(idx)
         _, row_indices = self.groups[idx]
+        raw_bag_size = int(len(row_indices))
+        row_indices = self._select_row_indices(row_indices)
         imgs = []
         paths = []
         meta_row = None
+        qc_dropped_count = 0
         for ridx in row_indices:
             row = self.df.iloc[ridx]
             meta_row = row
@@ -602,6 +772,9 @@ class AgeBagDataset(Dataset):
                 with Image.open(path).convert("RGB") as im:
                     if self.canonicalize_os_to_od and str(row.get("eye", "")).strip().upper() == "OS":
                         im = ImageOps.mirror(im)
+                    if self.quality_filter and not self._passes_quality_filter(im):
+                        qc_dropped_count += 1
+                        continue
                     img = self.transform(im)
             except Exception as e:
                 if self.skip_broken:
@@ -612,10 +785,14 @@ class AgeBagDataset(Dataset):
 
         if not imgs or meta_row is None:
             return None
+        if self.min_bag_size > 0 and len(imgs) < self.min_bag_size:
+            return None
 
         bag = torch.stack(imgs, dim=0)
         sample = {
             "images": bag,
+            "raw_bag_size": raw_bag_size,
+            "qc_dropped_count": int(qc_dropped_count),
             "day": float(meta_row["day"]),
             "age_days": float(meta_row.get("AGE", math.nan)),
             "group": meta_row.get("group_norm", "Unknown"),

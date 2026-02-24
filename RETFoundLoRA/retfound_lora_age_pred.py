@@ -222,10 +222,16 @@ class AttentionMILRegressor(nn.Module):
         attn_dim: int = 128,
         hidden_dim: int = 256,
         dropout: float = 0.2,
+        heteroscedastic: bool = False,
+        logvar_min: float = -10.0,
+        logvar_max: float = 6.0,
     ):
         super().__init__()
         attn_dim = int(max(16, attn_dim))
         hidden_dim = int(max(16, hidden_dim))
+        self.heteroscedastic = bool(heteroscedastic)
+        self.logvar_min = float(logvar_min)
+        self.logvar_max = float(logvar_max)
         self.attn = nn.Sequential(
             nn.Linear(in_dim, attn_dim),
             nn.Tanh(),
@@ -237,8 +243,16 @@ class AttentionMILRegressor(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        self.logvar_reg = None
+        if self.heteroscedastic:
+            self.logvar_reg = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
 
-    def forward(self, feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, feats: torch.Tensor, return_pooled: bool = False, return_logvar: bool = False):
         if feats.ndim != 2:
             raise ValueError(f"Expected feats shape [N, D], got {tuple(feats.shape)}")
         if feats.shape[0] == 0:
@@ -247,6 +261,16 @@ class AttentionMILRegressor(nn.Module):
         weights = torch.softmax(logits, dim=0)
         pooled = torch.sum(feats * weights.unsqueeze(-1), dim=0, keepdim=True)  # [1, D]
         pred = self.reg(pooled).view(-1)  # [1]
+        logvar = None
+        if return_logvar and self.logvar_reg is not None:
+            logvar = self.logvar_reg(pooled).view(-1)
+            logvar = torch.clamp(logvar, min=self.logvar_min, max=self.logvar_max)
+        if return_pooled and return_logvar:
+            return pred, weights, pooled, logvar
+        if return_pooled:
+            return pred, weights, pooled
+        if return_logvar:
+            return pred, weights, logvar
         return pred, weights
 
 
@@ -269,11 +293,18 @@ class RETFoundLoRAAgePred(nn.Module):
                  pre_adapter_hidden_dim: int = 16,
                  use_mil_attention: bool = False,
                  mil_attn_dim: int = 128,
-                 mil_hidden_dim: int = 256):
+                 mil_hidden_dim: int = 256,
+                 heteroscedastic_regression: bool = False,
+                 ordinal_num_bins: int = 0,
+                 ordinal_aux_hidden_dim: int = 0):
         super().__init__()
         self.keep_spatial_tokens = bool(keep_spatial_tokens)
         self.use_pre_adapter = bool(use_pre_adapter)
         self.use_mil_attention = bool(use_mil_attention)
+        self.heteroscedastic_regression = bool(heteroscedastic_regression)
+        self.configured_lora_blocks = int(max(0, lora_blocks))
+        self.active_lora_blocks = int(max(0, lora_blocks))
+        self.ordinal_num_bins = int(max(0, ordinal_num_bins))
 
         self.backbone = load_retfound_backbone_with_lora(
             ckpt_path=ckpt_path,
@@ -305,16 +336,64 @@ class RETFoundLoRAAgePred(nn.Module):
             upsample_factor=upsample_factor
         )
         self.mil_head = None
+        self.ordinal_head = None
         if self.use_mil_attention:
             self.mil_head = AttentionMILRegressor(
                 in_dim=backbone_channels,
                 attn_dim=mil_attn_dim,
                 hidden_dim=mil_hidden_dim,
                 dropout=head_dropout,
+                heteroscedastic=self.heteroscedastic_regression,
             )
             # MIL mode uses attention pooling head instead of the spatial age head.
             for p in self.head.parameters():
                 p.requires_grad = False
+
+        if self.ordinal_num_bins >= 2:
+            aux_hidden = int(max(16, ordinal_aux_hidden_dim or head_hidden_dim))
+            self.ordinal_head = nn.Sequential(
+                nn.Linear(backbone_channels, aux_hidden),
+                nn.ReLU(inplace=True),
+                nn.Dropout(head_dropout),
+                nn.Linear(aux_hidden, self.ordinal_num_bins - 1),
+            )
+
+    @staticmethod
+    def _set_block_lora_trainable(block: nn.Module, enabled: bool) -> bool:
+        """Enable/disable LoRA delta params inside one transformer block."""
+        changed_any = False
+        for mod in block.modules():
+            if isinstance(mod, (lora.Linear, lora.MergedLinear)):
+                for name, p in mod.named_parameters(recurse=False):
+                    if name.startswith("lora_"):
+                        p.requires_grad = bool(enabled)
+                        changed_any = True
+        return changed_any
+
+    def set_active_lora_blocks(self, active_blocks: int) -> int:
+        """
+        Freeze/unfreeze LoRA params by transformer block.
+
+        The model must be built with LoRA injected into the last `configured_lora_blocks`
+        blocks. This method activates only the last `active_blocks` of those injected
+        blocks and keeps earlier injected blocks frozen.
+        """
+        if not hasattr(self, "backbone") or not hasattr(self.backbone, "blocks"):
+            return 0
+        total_blocks = len(self.backbone.blocks)
+        max_active = int(min(max(0, active_blocks), self.configured_lora_blocks, total_blocks))
+        start_injected = total_blocks - self.configured_lora_blocks
+        start_active = total_blocks - max_active
+
+        n_toggled = 0
+        for idx, block in enumerate(self.backbone.blocks):
+            if idx < start_injected:
+                continue  # no LoRA modules injected here
+            enable = idx >= start_active
+            if self._set_block_lora_trainable(block, enable):
+                n_toggled += 1
+        self.active_lora_blocks = max_active
+        return max_active
 
     def extract_spatial_features(self, x: torch.Tensor) -> torch.Tensor:
         if self.pre_adapter is not None:
@@ -362,10 +441,29 @@ class RETFoundLoRAAgePred(nn.Module):
             return feats
         raise RuntimeError(f"Unexpected feature shape from backbone: {tuple(feats.shape)}")
 
-    def mil_predict_from_features(self, feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def mil_predict_from_features(
+        self,
+        feats: torch.Tensor,
+        return_pooled: bool = False,
+        return_logvar: bool = False,
+    ):
         if self.mil_head is None:
             raise RuntimeError("MIL head is not enabled. Build model with use_mil_attention=True.")
-        return self.mil_head(feats)
+        return self.mil_head(feats, return_pooled=return_pooled, return_logvar=return_logvar)
+
+    def ordinal_logits_from_pooled_features(self, pooled_feats: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Predict ordinal logits from pooled per-bag feature vectors [B, D].
+
+        Returns None when ordinal auxiliary head is disabled.
+        """
+        if self.ordinal_head is None:
+            return None
+        if pooled_feats.ndim == 3 and pooled_feats.shape[1] == 1:
+            pooled_feats = pooled_feats.squeeze(1)
+        if pooled_feats.ndim != 2:
+            raise ValueError(f"Expected pooled_feats shape [B, D], got {tuple(pooled_feats.shape)}")
+        return self.ordinal_head(pooled_feats)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.extract_spatial_features(x)
@@ -407,6 +505,8 @@ class RETFoundLoRAAgePred(nn.Module):
             state["pre_adapter"] = self.pre_adapter.state_dict()
         if self.mil_head is not None:
             state["mil_head"] = self.mil_head.state_dict()
+        if self.ordinal_head is not None:
+            state["ordinal_head"] = self.ordinal_head.state_dict()
         torch.save(state, path)
 
     def load_lora_checkpoint(self, path: str):
@@ -431,6 +531,11 @@ class RETFoundLoRAAgePred(nn.Module):
                     self.mil_head.load_state_dict(checkpoint["mil_head"], strict=False)
                 else:
                     print("[WARN] Checkpoint missing mil_head weights; MIL head remains randomly initialized.")
+            if self.ordinal_head is not None:
+                if "ordinal_head" in checkpoint:
+                    self.ordinal_head.load_state_dict(checkpoint["ordinal_head"], strict=False)
+                else:
+                    print("[WARN] Checkpoint missing ordinal_head weights; ordinal aux head remains randomly initialized.")
             if "head" in checkpoint:
                 self.head.load_state_dict(checkpoint["head"])
             else:

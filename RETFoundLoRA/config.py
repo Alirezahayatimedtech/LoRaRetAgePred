@@ -52,7 +52,7 @@ SUBSET_SIZE = None
 SUBSET_FRACTION = None
 
 # Augmentation defaults
-AUG_LEVEL = "medium"  # low | medium | high
+AUG_LEVEL = "mild"  # mild (alias of low) | low | medium | high
 MIXUP_ALPHA = 0.2   # uniform mix ratios to bridge sparse days
 MIXUP_PROB = 0.2
 LABEL_NOISE_STD = 2.0  # small biological jitter around nominal day labels

@@ -169,6 +169,10 @@ def make_loaders(
     aug_level: str = "medium",
     enable_photometric_aug: bool = True,
     mil_attention: bool = False,
+    mil_view_balance: bool = False,
+    mil_max_per_view: int = 0,
+    mil_min_bag_size: int = 0,
+    mil_quality_filter: bool = False,
 ):
     tf_train = make_transform(
         img_size=img_size,
@@ -180,10 +184,46 @@ def make_loaders(
     pin = torch.cuda.is_available()
 
     if mil_attention:
-        train_ds = AgeBagDataset(train_df, tf_train) if len(train_df) else None
-        val_ds = AgeBagDataset(val_df, tf_eval) if len(val_df) else None
-        test_ds = AgeBagDataset(test_df, tf_eval) if len(test_df) else None
-        ctrl_test_ds = AgeBagDataset(ctrl_test_df, tf_eval) if len(ctrl_test_df) else None
+        train_ds = AgeBagDataset(
+            train_df,
+            tf_train,
+            train_mode=True,
+            view_balance=mil_view_balance,
+            max_per_view=mil_max_per_view,
+            min_bag_size=mil_min_bag_size,
+            quality_filter=mil_quality_filter,
+            dataset_name="train",
+        ) if len(train_df) else None
+        val_ds = AgeBagDataset(
+            val_df,
+            tf_eval,
+            train_mode=False,
+            view_balance=False,
+            max_per_view=0,
+            min_bag_size=mil_min_bag_size,
+            quality_filter=mil_quality_filter,
+            dataset_name="val",
+        ) if len(val_df) else None
+        test_ds = AgeBagDataset(
+            test_df,
+            tf_eval,
+            train_mode=False,
+            view_balance=False,
+            max_per_view=0,
+            min_bag_size=mil_min_bag_size,
+            quality_filter=mil_quality_filter,
+            dataset_name="test",
+        ) if len(test_df) else None
+        ctrl_test_ds = AgeBagDataset(
+            ctrl_test_df,
+            tf_eval,
+            train_mode=False,
+            view_balance=False,
+            max_per_view=0,
+            min_bag_size=mil_min_bag_size,
+            quality_filter=mil_quality_filter,
+            dataset_name="ctrl_test",
+        ) if len(ctrl_test_df) else None
     else:
         train_ds = AgeImageDataset(train_df, tf_train) if len(train_df) else None
         val_ds = AgeImageDataset(val_df, tf_eval) if len(val_df) else None
@@ -256,6 +296,10 @@ def prepare_data(
     cohort_stratified_split: bool = False,
     enable_photometric_aug: bool = True,
     mil_attention: bool = False,
+    mil_view_balance: bool = False,
+    mil_max_per_view: int = 0,
+    mil_min_bag_size: int = 0,
+    mil_quality_filter: bool = False,
 ):
     train_groups_set = set(train_groups or [])
     test_groups_set = set(test_groups or [])
@@ -284,30 +328,35 @@ def prepare_data(
     else:
         df["sex"] = "Unknown"
 
-    # Normalize cohort column (prefer cohort_number if present)
+    # Normalize cohort column. Important: do NOT overwrite existing cohort labels with
+    # `cohort_number` when they conflict; the metadata contains collisions where
+    # `cohort_number` is wrong for some rows (e.g. path/cohort says 3 but cohort_number=1).
+    def _norm_cohort(val):
+        if pd.isna(val):
+            return None
+        s = str(val).strip()
+        if not s:
+            return None
+        try:
+            fv = float(s)
+            if fv.is_integer():
+                return str(int(fv))
+            return str(fv)
+        except Exception:
+            return s
+
+    cohort_existing = df["cohort"].apply(_norm_cohort) if "cohort" in df.columns else pd.Series([None] * len(df), index=df.index)
     if "cohort_number" in df.columns:
-        def _norm_cohort(val):
-            if pd.isna(val):
-                return None
-            s = str(val).strip()
-            if not s:
-                return None
-            try:
-                fv = float(s)
-                if fv.is_integer():
-                    return str(int(fv))
-                return str(fv)
-            except Exception:
-                return s
         cohort_num = df["cohort_number"].apply(_norm_cohort)
-        if "cohort" in df.columns:
-            df["cohort"] = cohort_num.fillna(df["cohort"])
-        else:
-            df["cohort"] = cohort_num
-    if "cohort" in df.columns:
-        df["cohort"] = df["cohort"].fillna("Unknown").astype(str).str.strip()
+        conflict_mask = cohort_existing.notna() & cohort_num.notna() & (cohort_existing != cohort_num)
+        if bool(conflict_mask.any()):
+            n_conf = int(conflict_mask.sum())
+            print(f"[WARN] cohort vs cohort_number conflict on {n_conf} rows; keeping existing `cohort` and only using `cohort_number` to fill missing cohort labels.")
+        cohort_final = cohort_existing.where(cohort_existing.notna(), cohort_num)
     else:
-        df["cohort"] = "Unknown"
+        cohort_final = cohort_existing
+
+    df["cohort"] = cohort_final.fillna("Unknown").astype(str).str.strip()
 
     keep_groups = train_groups_set | test_groups_set if (train_groups_set or test_groups_set) else None
     if keep_groups:
@@ -413,5 +462,9 @@ def prepare_data(
         aug_level=aug_level,
         enable_photometric_aug=enable_photometric_aug,
         mil_attention=mil_attention,
+        mil_view_balance=mil_view_balance,
+        mil_max_per_view=mil_max_per_view,
+        mil_min_bag_size=mil_min_bag_size,
+        mil_quality_filter=mil_quality_filter,
     )
     return train_df, val_df, ctrl_test_df, test_df, loaders

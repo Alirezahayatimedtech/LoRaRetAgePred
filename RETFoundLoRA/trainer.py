@@ -1,5 +1,6 @@
 """Training and evaluation engine for RETFound LoRA age regression."""
 
+import math
 from typing import Optional, Tuple
 
 import numpy as np
@@ -56,6 +57,52 @@ class Trainer:
         self.model = model
         self.device = device
         self.loss_fn = nn.SmoothL1Loss(beta=1.0, reduction="none")
+        self._ordinal_bins_cache = {}
+        self._warned_ordinal_target_mismatch = False
+
+    @staticmethod
+    def _heteroscedastic_enabled(args) -> bool:
+        return bool(getattr(args, "heteroscedastic_regression", False))
+
+    @staticmethod
+    def _hetero_norm_params(args) -> Tuple[float, float]:
+        mean = float(getattr(args, "hetero_target_mean", 0.0) or 0.0)
+        std = float(getattr(args, "hetero_target_std", 1.0) or 1.0)
+        if (not np.isfinite(std)) or std <= 1e-6:
+            std = 1.0
+        return mean, std
+
+    @classmethod
+    def _hetero_age_to_z(cls, x: torch.Tensor, args) -> torch.Tensor:
+        mean, std = cls._hetero_norm_params(args)
+        return (x - mean) / std
+
+    @classmethod
+    def _hetero_z_to_age(cls, x: torch.Tensor, args) -> torch.Tensor:
+        mean, std = cls._hetero_norm_params(args)
+        return x * std + mean
+
+    @classmethod
+    def _hetero_logvar_z_to_age(cls, log_var_z: torch.Tensor, args) -> torch.Tensor:
+        _, std = cls._hetero_norm_params(args)
+        return log_var_z + (2.0 * math.log(std))
+
+    @staticmethod
+    def _gaussian_nll(mu: torch.Tensor, log_var: torch.Tensor, target: torch.Tensor, reduction: str = "none") -> torch.Tensor:
+        """
+        Heteroscedastic Gaussian NLL for scalar regression:
+          0.5 * (log_var + (y-mu)^2 / exp(log_var))
+        """
+        mu = mu.view(-1)
+        target = target.view(-1)
+        log_var = log_var.view(-1)
+        inv_var = torch.exp(-log_var)
+        loss = 0.5 * (log_var + (target - mu) ** 2 * inv_var)
+        if reduction == "mean":
+            return loss.mean()
+        if reduction == "sum":
+            return loss.sum()
+        return loss
 
     @staticmethod
     def _group_keys(batch, days, aggregate_by_rat: bool = False):
@@ -70,22 +117,167 @@ class Trainer:
         # Skew disabled: use plain Smooth L1 (Huber)
         return raw_loss
 
-    def _mil_predict_batch(self, batch):
+    def _ordinal_aux_enabled(self, args) -> bool:
+        if args is None:
+            return False
+        if not bool(getattr(args, "ordinal_aux", False)):
+            return False
+        if float(getattr(args, "ordinal_aux_weight", 0.0) or 0.0) <= 0:
+            return False
+        return hasattr(self.model, "ordinal_head") and getattr(self.model, "ordinal_head", None) is not None
+
+    def _get_ordinal_bins_tensor(self, args) -> Optional[torch.Tensor]:
+        vals = getattr(args, "ordinal_bin_values_resolved", None)
+        if not vals:
+            return None
+        key = tuple(float(v) for v in vals)
+        t = self._ordinal_bins_cache.get(key)
+        if t is None or t.device != self.device:
+            t = torch.tensor(key, dtype=torch.float32, device=self.device)
+            self._ordinal_bins_cache[key] = t
+        return t
+
+    def _ordinal_aux_loss(self, ordinal_logits: torch.Tensor, targets: torch.Tensor, args) -> Optional[torch.Tensor]:
+        """
+        CORAL-style ordinal auxiliary loss over discrete age bins.
+
+        `ordinal_logits`: [B, K-1], `targets`: [B] in age units.
+        """
+        if ordinal_logits is None or ordinal_logits.numel() == 0:
+            return None
+        bins = self._get_ordinal_bins_tensor(args)
+        if bins is None or bins.numel() < 2:
+            return None
+        if ordinal_logits.ndim != 2:
+            return None
+        num_bins = int(bins.numel())
+        if int(ordinal_logits.shape[-1]) != num_bins - 1:
+            return None
+
+        tgt = targets.view(-1).to(self.device, dtype=torch.float32)
+        # Map to the nearest known age bin (robust to float formatting noise).
+        d = torch.abs(tgt.unsqueeze(1) - bins.unsqueeze(0))
+        class_idx = torch.argmin(d, dim=1)
+        min_diff = d.gather(1, class_idx.unsqueeze(1)).squeeze(1)
+        if (not self._warned_ordinal_target_mismatch) and torch.any(min_diff > 0.5):
+            self._warned_ordinal_target_mismatch = True
+            bad = float(torch.max(min_diff).detach().cpu().item())
+            print(f"[ORD] Warning: target ages do not exactly match ordinal bins (max nearest-bin diff={bad:.3f}). Using nearest-bin mapping.")
+
+        thresholds = torch.arange(num_bins - 1, device=self.device).unsqueeze(0)  # [1, K-1]
+        ordinal_targets = (class_idx.unsqueeze(1) > thresholds).to(ordinal_logits.dtype)
+        loss = nn.functional.binary_cross_entropy_with_logits(ordinal_logits, ordinal_targets, reduction="mean")
+        return loss
+
+    def _mil_predict_batch(self, batch, return_pooled: bool = False, return_logvar: bool = False):
         """MIL forward for a collated bag batch (bag = rat_id/eye/day)."""
         bags = batch.get("bags", [])
         if not bags:
-            return torch.empty(0, device=self.device), []
+            empty_preds = torch.empty(0, device=self.device)
+            empty_pooled = torch.empty(0, 0, device=self.device) if return_pooled else None
+            empty_logv = torch.empty(0, device=self.device) if return_logvar else None
+            if return_logvar:
+                return empty_preds, [], empty_pooled, empty_logv
+            return empty_preds, [], empty_pooled
         bag_sizes = [int(b.shape[0]) for b in bags]
         all_imgs = torch.cat([b.to(self.device, non_blocking=True) for b in bags], dim=0)
         feats = self.model.extract_image_features(all_imgs)
         feat_splits = torch.split(feats, bag_sizes, dim=0)
         preds = []
         attn_weights = []
+        pooled_feats = []
+        logvars = []
         for f in feat_splits:
-            p, w = self.model.mil_predict_from_features(f)
+            if return_pooled and return_logvar:
+                p, w, pooled, lv = self.model.mil_predict_from_features(f, return_pooled=True, return_logvar=True)
+                pooled_feats.append(pooled.view(1, -1))
+                logvars.append(lv.view(-1)[0] if lv is not None else torch.zeros_like(p.view(-1)[0]))
+            elif return_pooled:
+                p, w, pooled = self.model.mil_predict_from_features(f, return_pooled=True)
+                pooled_feats.append(pooled.view(1, -1))
+            elif return_logvar:
+                p, w, lv = self.model.mil_predict_from_features(f, return_logvar=True)
+                logvars.append(lv.view(-1)[0] if lv is not None else torch.zeros_like(p.view(-1)[0]))
+            else:
+                p, w = self.model.mil_predict_from_features(f)
             preds.append(p.view(-1)[0])
             attn_weights.append(w)
-        return torch.stack(preds, dim=0), attn_weights
+        pooled_cat = torch.cat(pooled_feats, dim=0) if return_pooled and pooled_feats else None
+        preds_cat = torch.stack(preds, dim=0)
+        if return_logvar:
+            logvars_cat = torch.stack(logvars, dim=0) if logvars else torch.zeros_like(preds_cat)
+            return preds_cat, attn_weights, pooled_cat, logvars_cat
+        return preds_cat, attn_weights, pooled_cat
+
+    def _mil_control_inter_eye_consistency(self, preds: torch.Tensor, batch, args):
+        """
+        Control-only OD/OS consistency penalty for MIL bags.
+
+        Pairs bags within the current batch using (rat_id, day) and penalizes prediction
+        differences between OD and OS when both eyes are present. This is batch-local and
+        therefore stronger when the MIL bag batch size is larger.
+        """
+        lam = float(getattr(args, "mil_control_inter_eye_lambda", 0.0) or 0.0)
+        if lam <= 0 or preds.numel() == 0:
+            return None, 0
+        if not isinstance(batch, dict):
+            return None, 0
+        if any(k not in batch for k in ("group", "rat_id", "eye", "day")):
+            return None, 0
+
+        def _norm_group(g):
+            return str(g).strip().lower()
+
+        def _norm_eye(e):
+            return str(e).strip().upper()
+
+        groups = batch.get("group", [])
+        rats = batch.get("rat_id", [])
+        eyes = batch.get("eye", [])
+        days = batch.get("day")
+        if days is None:
+            return None, 0
+        if torch.is_tensor(days):
+            day_vals = [float(d.item()) for d in days]
+        else:
+            day_vals = [float(d) for d in days]
+
+        paired_diffs = []
+        buckets = {}
+        n = min(len(groups), len(rats), len(eyes), len(day_vals), int(preds.numel()))
+        for i in range(n):
+            if _norm_group(groups[i]) != "controls":
+                continue
+            eye = _norm_eye(eyes[i])
+            if eye not in ("OD", "OS"):
+                continue
+            # Round day to avoid float-key noise while preserving intended day bins.
+            day_key = int(round(day_vals[i])) if math.isfinite(day_vals[i]) else day_vals[i]
+            key = (str(rats[i]), day_key)
+            buckets.setdefault(key, {}).setdefault(eye, []).append(i)
+
+        for eye_map in buckets.values():
+            if "OD" not in eye_map or "OS" not in eye_map:
+                continue
+            od_pred = preds[torch.as_tensor(eye_map["OD"], device=preds.device)].mean()
+            os_pred = preds[torch.as_tensor(eye_map["OS"], device=preds.device)].mean()
+            paired_diffs.append(od_pred - os_pred)
+
+        if not paired_diffs:
+            return None, 0
+
+        diffs = torch.stack(paired_diffs, dim=0)
+        mode = str(getattr(args, "mil_control_inter_eye_loss", "l1")).lower()
+        if mode == "smoothl1":
+            penalty = nn.functional.smooth_l1_loss(
+                diffs,
+                torch.zeros_like(diffs),
+                reduction="mean",
+                beta=1.0,
+            )
+        else:
+            penalty = torch.mean(torch.abs(diffs))
+        return penalty, int(diffs.numel())
 
     def train_one_epoch(self, loader, optimizer, args) -> float:
         self.model.train()
@@ -95,13 +287,36 @@ class Trainer:
             if batch is None:
                 continue
             if getattr(args, "mil_attention", False):
-                preds, _ = self._mil_predict_batch(batch)
-                targets = batch["age_days"].to(self.device, non_blocking=True).view(-1)
+                use_ord = self._ordinal_aux_enabled(args)
+                use_hetero = self._heteroscedastic_enabled(args)
+                if use_hetero:
+                    preds, _, pooled_feats, pred_log_var = self._mil_predict_batch(batch, return_pooled=use_ord, return_logvar=True)
+                else:
+                    preds, _, pooled_feats = self._mil_predict_batch(batch, return_pooled=use_ord)
+                    pred_log_var = None
+                targets_clean = batch["age_days"].to(self.device, non_blocking=True).view(-1)
+                targets = targets_clean
                 if args.label_noise_std > 0:
                     targets = targets + torch.randn_like(targets) * args.label_noise_std
-                raw_loss = self.loss_fn(preds, targets)
-                raw_loss = self._apply_skew(raw_loss, preds, targets, args)
-                loss = torch.mean(raw_loss)
+                if use_hetero and pred_log_var is not None:
+                    targets_z = self._hetero_age_to_z(targets, args)
+                    loss = self._gaussian_nll(preds, pred_log_var, targets_z, reduction="mean")
+                    logvar_reg_w = float(getattr(args, "hetero_logvar_reg_weight", 0.0) or 0.0)
+                    if logvar_reg_w > 0:
+                        loss = loss + logvar_reg_w * torch.mean(pred_log_var ** 2)
+                else:
+                    raw_loss = self.loss_fn(preds, targets)
+                    raw_loss = self._apply_skew(raw_loss, preds, targets, args)
+                    loss = torch.mean(raw_loss)
+                if use_ord and pooled_feats is not None:
+                    ord_logits = self.model.ordinal_logits_from_pooled_features(pooled_feats)
+                    ord_loss = self._ordinal_aux_loss(ord_logits, targets_clean, args)
+                    if ord_loss is not None:
+                        loss = loss + float(getattr(args, "ordinal_aux_weight", 0.0)) * ord_loss
+                preds_for_cons = self._hetero_z_to_age(preds, args) if use_hetero else preds
+                cons_penalty, _ = self._mil_control_inter_eye_consistency(preds_for_cons, batch, args)
+                if cons_penalty is not None:
+                    loss = loss + float(getattr(args, "mil_control_inter_eye_lambda", 0.0)) * cons_penalty
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -210,7 +425,11 @@ class Trainer:
             if batch is None:
                 continue
             if args and getattr(args, "mil_attention", False):
-                preds, _ = self._mil_predict_batch(batch)
+                if self._heteroscedastic_enabled(args):
+                    preds_z, _, _, _ = self._mil_predict_batch(batch, return_logvar=True)
+                    preds = self._hetero_z_to_age(preds_z, args)
+                else:
+                    preds, _, _ = self._mil_predict_batch(batch)
                 targets = batch["age_days"].to(self.device, non_blocking=True).view(-1)
                 raw_loss = loss_fn(preds, targets)
                 raw_loss = self._apply_skew(raw_loss, preds, targets, args)
@@ -295,10 +514,26 @@ class Trainer:
             if batch is None:
                 continue
             if getattr(args, "mil_attention", False):
-                preds_t, _ = self._mil_predict_batch(batch)
+                use_hetero = self._heteroscedastic_enabled(args)
+                if use_hetero:
+                    preds_z_t, _, _, pred_log_var_z_t = self._mil_predict_batch(batch, return_logvar=True)
+                    preds_t = self._hetero_z_to_age(preds_z_t, args)
+                    pred_log_var_t = self._hetero_logvar_z_to_age(pred_log_var_z_t, args) if pred_log_var_z_t is not None else None
+                else:
+                    preds_t, _, _ = self._mil_predict_batch(batch)
+                    pred_log_var_t = None
                 preds = preds_t.detach().cpu().view(-1).numpy()
+                pred_log_var_np = pred_log_var_t.detach().cpu().view(-1).numpy() if pred_log_var_t is not None else None
+                pred_sigma_np = np.exp(0.5 * pred_log_var_np) if pred_log_var_np is not None else None
                 targets_np = batch["age_days"].detach().cpu().view(-1).numpy()
                 days_np = batch["day"].detach().cpu().view(-1).numpy()
+                bag_sizes_kept = batch.get("bag_sizes")
+                bag_sizes_raw = batch.get("bag_sizes_raw")
+                bag_qc_dropped = batch.get("bag_qc_dropped")
+                kept_np = bag_sizes_kept.detach().cpu().view(-1).numpy() if torch.is_tensor(bag_sizes_kept) else np.full(len(preds), np.nan)
+                raw_np = bag_sizes_raw.detach().cpu().view(-1).numpy() if torch.is_tensor(bag_sizes_raw) else kept_np.copy()
+                dropped_np = bag_qc_dropped.detach().cpu().view(-1).numpy() if torch.is_tensor(bag_qc_dropped) else np.zeros(len(preds), dtype=float)
+                lowconf_thr = int(max(0, getattr(args, "mil_infer_lowconf_bag_size", 0) or 0))
                 groups = list(batch.get("group", ["Unknown"] * len(preds)))
                 rats = list(batch.get("rat_id", [""] * len(preds)))
                 eyes = list(batch.get("eye", ["Unknown"] * len(preds)))
@@ -340,8 +575,13 @@ class Trainer:
                             alpha, beta = params
                             preds = apply_correction(targets_np, preds, alpha, beta)
 
-                for rat, eye, sex, coh, grp, d, y_true, y_pred in zip(rats, eyes, sexes, cohorts, groups, days_np, targets_np, preds):
-                    rows.append({
+                for j, (rat, eye, sex, coh, grp, d, y_true, y_pred, n_kept, n_raw, n_drop) in enumerate(zip(
+                    rats, eyes, sexes, cohorts, groups, days_np, targets_np, preds, kept_np, raw_np, dropped_np
+                )):
+                    n_kept_i = int(n_kept) if np.isfinite(n_kept) else None
+                    n_raw_i = int(n_raw) if np.isfinite(n_raw) else None
+                    n_drop_i = int(n_drop) if np.isfinite(n_drop) else None
+                    row = {
                         "rat_id": rat,
                         "eye": eye,
                         "sex": sex,
@@ -350,7 +590,16 @@ class Trainer:
                         "day": float(d),
                         "age_true": float(y_true),
                         "age_pred": float(y_pred),
-                    })
+                        "mil_bag_n_kept": n_kept_i,
+                        "mil_bag_n_raw": n_raw_i,
+                        "mil_bag_n_qc_dropped": n_drop_i,
+                        "mil_low_conf_bag": bool(lowconf_thr > 0 and n_kept_i is not None and n_kept_i < lowconf_thr),
+                    }
+                    if pred_log_var_np is not None:
+                        # sigma is a learned uncertainty estimate from the heteroscedastic head.
+                        row["pred_log_var"] = float(pred_log_var_np[j])
+                        row["pred_sigma"] = float(pred_sigma_np[j])
+                    rows.append(row)
                 continue
             imgs = batch["image"].to(device, non_blocking=True)
             targets = batch["age_days"].to(device, non_blocking=True)
@@ -605,7 +854,24 @@ class Trainer:
                 "sex": "first",
                 "cohort": "first",
             }
+            if "mil_bag_n_kept" in df_pred.columns:
+                agg_cols["mil_bag_n_kept"] = "mean"
+            if "mil_bag_n_raw" in df_pred.columns:
+                agg_cols["mil_bag_n_raw"] = "mean"
+            if "mil_bag_n_qc_dropped" in df_pred.columns:
+                agg_cols["mil_bag_n_qc_dropped"] = "mean"
+            if "mil_low_conf_bag" in df_pred.columns:
+                agg_cols["mil_low_conf_bag"] = "max"
+            if "pred_log_var" in df_pred.columns:
+                agg_cols["pred_log_var"] = "mean"
+            if "pred_sigma" in df_pred.columns:
+                agg_cols["pred_sigma"] = "mean"
             df_agg = df_pred.groupby(["rat_id", "eye", "day"], as_index=False).agg(agg_cols)
+            for c in ("mil_bag_n_kept", "mil_bag_n_raw", "mil_bag_n_qc_dropped"):
+                if c in df_agg.columns:
+                    df_agg[c] = np.rint(pd.to_numeric(df_agg[c], errors="coerce")).astype("Int64")
+            if "mil_low_conf_bag" in df_agg.columns:
+                df_agg["mil_low_conf_bag"] = df_agg["mil_low_conf_bag"].astype(bool)
             df_agg["RAG"] = df_agg["age_pred"] - df_agg["age_true"]
 
         meta_df = load_metadata(
@@ -617,13 +883,39 @@ class Trainer:
             exclude_recovery_paths=False,
             verbose=False,
         )
-        rat_to_cohort = dict(zip(meta_df["rat_id"], meta_df["cohort"]))
-        df_agg["cohort"] = df_agg["rat_id"].map(rat_to_cohort).fillna(df_agg["cohort"])
+        # Backfill missing/unknown cohort labels conservatively.
+        # Do not overwrite existing cohort labels in predictions because `rat_id`
+        # can be reused across cohorts in this dataset.
+        try:
+            rat_cohort_unique = (
+                meta_df[["rat_id", "cohort"]]
+                .dropna()
+                .astype({"rat_id": str, "cohort": str})
+                .groupby("rat_id")["cohort"]
+                .agg(lambda s: s.iloc[0] if s.nunique() == 1 else np.nan)
+            )
+            mapped_cohort = df_agg["rat_id"].astype(str).map(rat_cohort_unique)
+            if "cohort" not in df_agg.columns:
+                df_agg["cohort"] = mapped_cohort
+            else:
+                cohort_existing = df_agg["cohort"]
+                missing_mask = cohort_existing.isna() | cohort_existing.astype(str).str.strip().isin(["", "Unknown", "nan"])
+                if missing_mask.any():
+                    df_agg.loc[missing_mask, "cohort"] = mapped_cohort.loc[missing_mask].fillna(df_agg.loc[missing_mask, "cohort"])
+        except Exception:
+            pass
 
         out_path = args.pred_csv.parent / output_name
         out_path.parent.mkdir(parents=True, exist_ok=True)
         df_agg.to_csv(out_path, index=False)
         print(f"[PRED] Saved detailed results to: {out_path} (N={len(df_agg)})")
+        if "mil_low_conf_bag" in df_agg.columns:
+            try:
+                n_lowconf = int(df_agg["mil_low_conf_bag"].astype(bool).sum())
+                if n_lowconf > 0:
+                    print(f"[PRED][MIL-QC] Low-confidence bags flagged: {n_lowconf}/{len(df_agg)}")
+            except Exception:
+                pass
         try:
             summary = df_agg.groupby(['cohort','group','day'])['RAG'].mean().reset_index()
             print(summary.to_string(index=False))
@@ -670,6 +962,11 @@ class Trainer:
                         p, _ = model.mil_predict_from_features(f)
                         pred_list.append(p.view(-1)[0])
                     preds = torch.stack(pred_list, dim=0)
+                    if bool(getattr(model, "heteroscedastic_regression", False)):
+                        mean = float(getattr(model, "hetero_target_mean", 0.0) or 0.0)
+                        std = float(getattr(model, "hetero_target_std", 1.0) or 1.0)
+                        if np.isfinite(std) and std > 1e-6:
+                            preds = preds * std + mean
                     targets = batch["age_days"].to(device, non_blocking=True)
                     ys_true.append(targets.detach().cpu().view(-1).numpy())
                     ys_pred.append(preds.detach().cpu().view(-1).numpy())
