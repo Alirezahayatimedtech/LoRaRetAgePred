@@ -12,6 +12,23 @@ RETFound-based OCT age regression pipeline with:
 - `RETFoundLoRA/`: training/eval code, RETFound+LoRA model, MIL mode, diagnostics, SSL manifest/launcher tools
 - `data_prep_age_lora.py`: shared metadata loading, transforms, image datasets, MIL bag datasets
 
+## Paper #1 Status (Control-Only Age Prediction)
+
+Completed in the current codebase:
+- control-only 3-fold CV pipeline (RETFound MAE-transductive + MIL + LoRA4)
+- backbone ablation (`RETFound`, `Xception`, `Random ViT`)
+- RETFound adaptation ablation (`LoRA` vs `full fine-tune` vs `frozen head-only`)
+- inter-eye reliability aggregation
+- saliency export (CLS-only checkpoints use gradient-saliency fallback)
+- LOCO cohort generalization runs (held-out cohort `1`, `2`, `3`)
+- paper-ready table/figure generation scripts and compact execution bundle tooling
+
+Local reporting artifacts (not pushed to GitHub):
+- `outputs/paper1/EXECUTION_REPORT.md`
+- `docs/Paper1_ControlOnly_Methods_Results_Claims.md`
+- `outputs/paper1/ablation/backbone_comparison.csv`
+- `outputs/paper1/lora_ablation/summary.csv`
+
 ## Current Best Supervised Setup (No SSL)
 
 Best performing configuration so far in this project:
@@ -48,16 +65,16 @@ Added utilities for control-first reliability analysis:
   - `--post-control-inter-eye-analysis`
   - `--post-control-matched-view`
 
-## SSL / MAE Domain Adaptation (Next Major Plan)
+## SSL / MAE Domain Adaptation (Implemented)
 
-We are moving toward **MAE-style continued pretraining on unlabeled rat OCT** starting from RETFound weights, then re-running the same supervised `MIL + LoRA` pipeline.
+The repo now includes and has been used for **MAE-style continued pretraining on unlabeled rat OCT** starting from RETFound weights, followed by supervised `MIL + LoRA` runs.
 
 Why:
 - reduce human -> rat OCT domain gap
 - improve cohort generalization (especially harder cohorts / older ages)
 - use all unlabeled OCT without age-label leakage
 
-Plan details and exact commands are in:
+Protocol details and exact commands are in:
 - `docs/MAE_SSL_Transductive_Plan.md`
 
 ### Included SSL tooling
@@ -180,6 +197,34 @@ Artifacts:
 Interpretation:
 - On this **narrow day 0/90 control-priority protocol**, the simple Xception baseline outperformed the current RETFound+MIL setup.
 - This does **not** prove RETFound is unhelpful in general; it means the RETFound advantage was not observed on this slice/protocol.
+
+## Backbone Ablation (Completed, Control-Priority Day 0/90)
+
+Fair comparison (same split/protocol, day `0/90`, control-priority):
+
+| Backbone | Control MAE | Control R² | HLS MAE | HLS R² |
+|---|---:|---:|---:|---:|
+| RETFound (MAE-transductive) + MIL + LoRA4 | 34.75 | 0.581 | 30.30 | 0.729 |
+| Xception | **23.44** | **0.791** | **26.97** | **0.732** |
+| Random ViT (frozen head-only baseline) | 70.46 | 0.090 | 71.21 | 0.128 |
+
+Summary:
+- Xception is the stronger backbone baseline on this narrow control-only day `0/90` slice.
+- Random ViT performs poorly, which supports the value of pretrained features in general.
+
+## RETFound Adaptation Ablation (Completed)
+
+RETFound-based adaptation comparison on the same control-priority day `0/90` protocol:
+
+| Method | Control MAE | HLS MAE | Control R² | HLS R² |
+|---|---:|---:|---:|---:|
+| Full fine-tune (RETFound backbone trainable) | **26.87** | **23.31** | **0.662** | **0.750** |
+| LoRA (current control-priority default) | 34.90 | 31.78 | 0.582 | 0.709 |
+| Frozen backbone + head only | 55.26 | 55.85 | 0.264 | 0.295 |
+
+Summary:
+- In this specific day `0/90` control-priority setting, **full fine-tuning beats LoRA**.
+- Frozen head-only underfits severely.
 
 ## Xception + RETFound Feature Distillation (Control-Only, Day 0/90)
 
