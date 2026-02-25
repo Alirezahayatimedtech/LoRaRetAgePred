@@ -1,0 +1,73 @@
+protocol_name: osd679_paper_protocol
+version: 1
+repo: RETFound_GeneLab
+description: >
+  Manuscript experiment manifest mapped to the current RETFoundLoRA CLI.
+  Use the shell wrappers in scripts/paper/ for execution.
+
+global_defaults:
+  cohorts: [1, 2, 3]
+  train_groups: ["Controls"]
+  test_groups: ["HLS (U)"]
+  aug_level: mild
+  photometric_aug: false
+  bias_correction: false
+  rat_level_split: true
+
+backbones:
+  retfound_mae_transductive_best:
+    model_type: retfound
+    backbone_ckpt: outputs/ssl_adapt/mae_transductive_c123_allages_fbmae_run50_live/mae_run/output_resume_from_e0/checkpoint-49.pth
+    mil_attention: true
+    mil_freeze_backbone: false
+    lora_blocks: 4
+    mil_attn_dim: 256
+    mil_hidden_dim: 512
+    lr: 1.0e-4
+  xception_control_baseline:
+    model_type: xception
+    lr: 1.0e-3
+
+experiments:
+  exp01_ctrl_cv:
+    status: ready
+    runner: scripts/paper/run_all_core_experiments.sh
+    objective: Normative aging baseline with rat-level 3-fold CV on Controls
+  exp02_hls_ood:
+    status: ready
+    runner: scripts/paper/run_all_core_experiments.sh
+    objective: Aggregate HLS OOD predictions from EXP-01 fold runs
+  exp03_inter_eye:
+    status: ready
+    runner: scripts/paper/run_all_core_experiments.sh
+    objective: Inter-eye reliability summary from paired prediction CSVs
+  exp04_saliency:
+    status: ready
+    runner: scripts/paper/run_all_core_experiments.sh
+    objective: Saliency example export using scripts/save_saliency_subset.py
+  exp05_backbone_ablation:
+    status: partial
+    runner: scripts/paper/run_backbone_ablation.sh
+    note: Random ViT baseline is not implemented in current run.py
+  exp06_lora_vs_finetune:
+    status: partial
+    note: Full fine-tuning in MIL path is not exposed cleanly by current CLI
+  exp07_loo_cohort:
+    status: requires_code_extension
+    note: Current --cohorts filter is global; separate train/test cohort filters are needed
+  exp08_bias_correction:
+    status: ready
+    note: Compare eval-only runs with and without bias correction
+  exp09_all_timepoints:
+    status: ready
+    note: Use --all-ages or explicit day whitelist
+  exp10_sex_stratified:
+    status: ready
+    script: scripts/stratify_by_sex.py
+  exp11_feature_distillation:
+    status: ready
+    note: Xception student + RETFound teacher feature-only distillation is implemented
+  exp12_rag_physiology:
+    status: ready
+    script: scripts/correlate_rag_physiology.py
+
