@@ -30,6 +30,33 @@ from paper_common import (  # noqa: E402
 
 def table1_control_performance(exp01_dir: Path, out_dir: Path) -> List[Path]:
     outputs: List[Path] = []
+    exp01_dir = Path(exp01_dir)
+    # Fast path: consume aggregate_cv outputs directly.
+    agg_summary = exp01_dir / "summary.csv"
+    agg_ctrl_rows = exp01_dir / "summary_control_cohort_day_fold_rows.csv"
+    if agg_summary.exists():
+        try:
+            mdf = pd.read_csv(agg_summary)
+            mdf = mdf[mdf["split"] == "control"].copy()
+            if not mdf.empty:
+                # Already aggregated mean/std table from aggregate_cv
+                p = out_dir / "table1_control_cv_performance.csv"
+                safe_mkdir_for_file(p)
+                mdf.to_csv(p, index=False)
+                outputs.append(p)
+            if agg_ctrl_rows.exists():
+                rows = pd.read_csv(agg_ctrl_rows)
+                numeric = [c for c in rows.columns if c not in {"cohort", "day", "run_dir", "run_name", "fold", "metrics_file"} and pd.api.types.is_numeric_dtype(rows[c])]
+                if numeric:
+                    agg = rows.groupby(["cohort", "day"], dropna=False)[numeric].agg(["mean", "std", "count"]).reset_index()
+                    agg.columns = ["cohort", "day"] + [f"{a}_{b}" for a, b in agg.columns.tolist()[2:]]
+                    p2 = out_dir / "table1_control_cohort_day_breakdown.csv"
+                    agg.to_csv(p2, index=False)
+                    outputs.append(p2)
+                return outputs
+        except Exception as e:
+            print(f"[WARN] Failed direct aggregate load for EXP-01 ({e}); falling back to run-dir parsing.")
+
     runs = collect_run_dirs([exp01_dir])
     if not runs:
         print(f"[WARN] EXP-01 runs not found under {exp01_dir}")
@@ -72,6 +99,26 @@ def table1_control_performance(exp01_dir: Path, out_dir: Path) -> List[Path]:
 
 def table2_hls_rag(exp02_dir: Path, out_dir: Path) -> List[Path]:
     outputs: List[Path] = []
+    exp02_dir = Path(exp02_dir)
+    # Fast path: consume aggregate_cv outputs directly.
+    agg_stress_rows = exp02_dir / "summary_stress_cohort_day_fold_rows.csv"
+    if agg_stress_rows.exists():
+        try:
+            rows = pd.read_csv(agg_stress_rows)
+            if "group" not in rows.columns:
+                rows["group"] = "stress"
+            numeric = [c for c in rows.columns if c not in {"cohort", "day", "group", "run_dir", "run_name", "fold", "metrics_file"} and pd.api.types.is_numeric_dtype(rows[c])]
+            if numeric:
+                agg = rows.groupby(["cohort", "group", "day"], dropna=False)[numeric].agg(["mean", "std", "count"]).reset_index()
+                agg.columns = ["cohort", "group", "day"] + [f"{a}_{b}" for a, b in agg.columns.tolist()[3:]]
+                p = out_dir / "table2_hls_rag_by_cohort_day.csv"
+                safe_mkdir_for_file(p)
+                agg.to_csv(p, index=False)
+                outputs.append(p)
+                return outputs
+        except Exception as e:
+            print(f"[WARN] Failed direct aggregate load for EXP-02 ({e}); falling back to run-dir parsing.")
+
     runs = collect_run_dirs([exp02_dir])
     if not runs:
         print(f"[WARN] EXP-02 runs not found under {exp02_dir}")
@@ -149,4 +196,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

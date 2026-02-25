@@ -18,12 +18,7 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from paper_common import (  # noqa: E402
-    collect_run_dirs,
-    discover_run_files,
-    load_or_build_inter_eye,
-    safe_mkdir_for_file,
-)
+from paper_common import collect_run_dirs, discover_run_files, load_or_build_inter_eye, safe_mkdir_for_file  # noqa: E402
 
 
 def _normalize_groupby(group_by: str) -> List[str]:
@@ -50,6 +45,39 @@ def _summarize_group(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
     return out
 
 
+def _collect_paired_csvs(input_roots: List[Path]) -> List[Path]:
+    files: List[Path] = []
+    for root in input_roots:
+        root = Path(root)
+        if root.is_file() and root.name.endswith("_inter_eye_differences.csv"):
+            files.append(root)
+            continue
+        if root.is_dir():
+            files.extend(root.rglob("*_inter_eye_differences*.csv"))
+    uniq = []
+    seen = set()
+    for p in sorted(files):
+        name = p.name
+        # Skip helper derivatives; keep the base paired CSVs only.
+        if any(tag in name for tag in ("matched_view", "reliability", "_thresholds")):
+            continue
+        sp = str(p.resolve())
+        if sp in seen:
+            continue
+        seen.add(sp)
+        uniq.append(p)
+    return uniq
+
+
+def _infer_split_from_pair_filename(path: Path) -> str:
+    nm = path.name.lower()
+    if "control" in nm:
+        return "control"
+    if "rag_experimental" in nm or "stress" in nm:
+        return "stress"
+    return "unknown"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Compute inter-eye MAD summaries from run outputs")
     ap.add_argument("--predictions-dir", type=Path, nargs="+", required=True, help="Run directories or roots containing run directories")
@@ -59,33 +87,53 @@ def main() -> None:
     ap.add_argument("--include-overall", action="store_true", help="Also append overall summary rows")
     args = ap.parse_args()
 
-    run_dirs = collect_run_dirs(args.predictions_dir)
-    # Fallback: user may pass a single run dir with no metrics_summary? include direct dirs.
-    if not run_dirs:
-        run_dirs = [p for p in args.predictions_dir if p.is_dir()]
-    if not run_dirs:
-        raise SystemExit("No run directories found.")
-
     group_cols = _normalize_groupby(args.group_by)
     rows = []
-    for run_dir in run_dirs:
-        rf = discover_run_files(run_dir)
-        for split, pair_csv, pred_csv in (
-            ("control", rf.control_inter_eye_csv, rf.control_pred_csv),
-            ("stress", rf.stress_inter_eye_csv, rf.stress_pred_csv),
-        ):
-            pair = load_or_build_inter_eye(pair_csv, pred_csv)
-            if pair is None or pair.empty:
+    # Prefer direct paired CSV discovery so fold-suffixed outputs are supported.
+    paired_csvs = _collect_paired_csvs(args.predictions_dir)
+    if paired_csvs:
+        for pair_csv in paired_csvs:
+            try:
+                pair = pd.read_csv(pair_csv)
+            except Exception as e:
+                print(f"[WARN] Failed to read paired CSV {pair_csv}: {e}")
+                continue
+            if pair.empty:
                 continue
             pair = pair.copy()
-            pair["run_dir"] = str(run_dir)
-            pair["run_name"] = run_dir.name
-            pair["split"] = split
+            pair["run_dir"] = str(pair_csv.parent)
+            pair["run_name"] = pair_csv.parent.name
+            pair["split"] = _infer_split_from_pair_filename(pair_csv)
             for c in group_cols:
                 if c not in pair.columns:
                     pair[c] = "Unknown"
                 pair[f"__grp__{c}"] = pair[c]
             rows.append(pair)
+    else:
+        run_dirs = collect_run_dirs(args.predictions_dir)
+        # Fallback: user may pass a single run dir with no metrics_summary? include direct dirs.
+        if not run_dirs:
+            run_dirs = [p for p in args.predictions_dir if p.is_dir()]
+        if not run_dirs:
+            raise SystemExit("No run directories found.")
+        for run_dir in run_dirs:
+            rf = discover_run_files(run_dir)
+            for split, pair_csv, pred_csv in (
+                ("control", rf.control_inter_eye_csv, rf.control_pred_csv),
+                ("stress", rf.stress_inter_eye_csv, rf.stress_pred_csv),
+            ):
+                pair = load_or_build_inter_eye(pair_csv, pred_csv)
+                if pair is None or pair.empty:
+                    continue
+                pair = pair.copy()
+                pair["run_dir"] = str(run_dir)
+                pair["run_name"] = run_dir.name
+                pair["split"] = split
+                for c in group_cols:
+                    if c not in pair.columns:
+                        pair[c] = "Unknown"
+                    pair[f"__grp__{c}"] = pair[c]
+                rows.append(pair)
 
     if not rows:
         raise SystemExit("No paired inter-eye data found.")
@@ -131,4 +179,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

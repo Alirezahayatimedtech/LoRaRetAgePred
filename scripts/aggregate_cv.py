@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,9 +21,9 @@ if str(THIS_DIR) not in sys.path:
 
 from paper_common import (  # noqa: E402
     collect_run_dirs,
-    discover_run_files,
     flatten_metric_summary_rows,
     groupwise_prediction_metrics,
+    infer_fold_index,
     load_prediction_csv,
     read_metrics_summary,
     safe_mkdir_for_file,
@@ -46,18 +46,71 @@ def summarize_metrics(df: pd.DataFrame, metrics: List[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def collect_fold_breakdowns(run_dirs: List[Path], split_name: str) -> pd.DataFrame:
-    csv_attr = "control_pred_csv" if split_name == "control" else "stress_pred_csv"
+def _metrics_files_from_inputs(input_roots: Sequence[Path]) -> List[Path]:
+    files: List[Path] = []
+    for root in input_roots:
+        root = Path(root)
+        if root.is_file() and root.name.startswith("metrics_summary") and root.suffix == ".csv":
+            files.append(root)
+            continue
+        if root.is_dir():
+            files.extend(root.rglob("metrics_summary*.csv"))
+    # stable unique
+    uniq: List[Path] = []
+    seen = set()
+    for p in sorted(files):
+        sp = str(p.resolve())
+        if sp in seen:
+            continue
+        seen.add(sp)
+        uniq.append(p)
+    return uniq
+
+
+def _suffix_from_metrics_file(metrics_csv: Path) -> str:
+    stem = metrics_csv.stem
+    if stem == "metrics_summary":
+        return ""
+    if stem.startswith("metrics_summary_"):
+        return "_" + stem[len("metrics_summary_") :]
+    return ""
+
+
+def _find_pred_csv_for_metrics(metrics_csv: Path, split_name: str) -> Optional[Path]:
+    parent = metrics_csv.parent
+    suf = _suffix_from_metrics_file(metrics_csv)
+    if split_name == "control":
+        candidates = [
+            f"control_val_results{suf}.csv",
+            f"control_test_results{suf}.csv",
+            f"control_results{suf}.csv",
+        ]
+    else:
+        candidates = [
+            f"rag_experimental_results{suf}.csv",
+            f"stress_results{suf}.csv",
+            f"test_results{suf}.csv",
+        ]
+    for name in candidates:
+        p = parent / name
+        if p.exists():
+            return p
+    return None
+
+
+def collect_fold_breakdowns(metric_files: List[Path], split_name: str) -> pd.DataFrame:
     frames = []
-    for run_dir in run_dirs:
-        rf = discover_run_files(run_dir)
-        pred_csv = getattr(rf, csv_attr)
+    for mfile in metric_files:
+        run_dir = mfile.parent
+        pred_csv = _find_pred_csv_for_metrics(mfile, split_name)
         if pred_csv is None or not pred_csv.exists():
             continue
         df = load_prediction_csv(pred_csv)
         breakdown = groupwise_prediction_metrics(df, ["cohort", "day"], include_inter_eye=(split_name == "control"))
         breakdown["run_dir"] = str(run_dir)
         breakdown["run_name"] = run_dir.name
+        breakdown["fold"] = infer_fold_index(mfile) if infer_fold_index(mfile) is not None else infer_fold_index(run_dir)
+        breakdown["metrics_file"] = str(mfile)
         frames.append(breakdown)
     if not frames:
         return pd.DataFrame()
@@ -85,17 +138,30 @@ def main() -> None:
     ap.add_argument("--emit-breakdowns", action="store_true", help="Also aggregate per-cohort/per-day prediction metrics and inter-eye summaries")
     args = ap.parse_args()
 
-    run_dirs = collect_run_dirs(args.input_dir)
-    if not run_dirs:
-        raise SystemExit("No run directories with metrics_summary.csv found.")
+    metric_files = _metrics_files_from_inputs(args.input_dir)
+    if not metric_files:
+        # backwards compatible exact-mode fallback
+        run_dirs = collect_run_dirs(args.input_dir)
+        if not run_dirs:
+            raise SystemExit("No metrics_summary*.csv files found.")
+        metric_files = []
+        for rd in run_dirs:
+            p = rd / "metrics_summary.csv"
+            if p.exists():
+                metric_files.append(p)
+    run_dirs = sorted({p.parent for p in metric_files})
 
     metric_rows = []
-    for rd in run_dirs:
-        rf = discover_run_files(rd)
-        if rf.metrics_csv is None:
-            continue
-        mdf = read_metrics_summary(rf.metrics_csv)
-        metric_rows.append(flatten_metric_summary_rows(rd, mdf))
+    for mfile in metric_files:
+        rd = mfile.parent
+        mdf = read_metrics_summary(mfile)
+        flat = flatten_metric_summary_rows(rd, mdf)
+        # Override fold inference from filename when fold suffix is only on metrics filename.
+        fold_idx = infer_fold_index(mfile)
+        if fold_idx is not None:
+            flat["fold"] = fold_idx
+        flat["metrics_file"] = str(mfile)
+        metric_rows.append(flat)
     if not metric_rows:
         raise SystemExit("No readable metrics_summary.csv files found.")
 
@@ -110,8 +176,8 @@ def main() -> None:
     print(f"[CV] Saved per-fold metric rows to {details_path}")
 
     if args.emit_breakdowns:
-        ctrl = collect_fold_breakdowns(run_dirs, "control")
-        stress = collect_fold_breakdowns(run_dirs, "stress")
+        ctrl = collect_fold_breakdowns(metric_files, "control")
+        stress = collect_fold_breakdowns(metric_files, "stress")
         if not ctrl.empty:
             ctrl_raw = args.output.with_name(args.output.stem + "_control_cohort_day_fold_rows.csv")
             ctrl.to_csv(ctrl_raw, index=False)
@@ -126,4 +192,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
