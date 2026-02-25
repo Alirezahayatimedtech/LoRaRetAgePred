@@ -52,9 +52,18 @@ class SimpleXceptionAgePred(nn.Module):
             hidden_dim=head_hidden_dim,
             dropout=head_dropout,
         )
+        # Optional student-side projection head used only for feature distillation.
+        self.distill_proj = None
 
     def extract_spatial_features(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)
+
+    def extract_image_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Return pooled per-image feature vectors [B, C] for distillation or simple heads."""
+        feats = self.extract_spatial_features(x)
+        if feats.ndim != 4:
+            raise RuntimeError(f"Expected Xception spatial features [B,C,H,W], got {tuple(feats.shape)}")
+        return F.adaptive_avg_pool2d(feats, 1).squeeze(-1).squeeze(-1)
 
     def forward(self, x: torch.Tensor):
         feats = self.extract_spatial_features(x)

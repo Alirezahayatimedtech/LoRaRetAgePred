@@ -153,6 +153,66 @@ Tradeoff vs the `<=90` supervised protocol:
 - Better control metrics and control inter-eye consistency
 - Worse HLS accuracy (and slightly worse HLS inter-eye) than training on `0/7/14/28/90`
 
+## Xception Baseline (Matched Control-Only Protocol, Day 0/90)
+
+To test whether RETFound provides a real benefit on the narrow control-priority slice, a matched Xception baseline was run with the same split/protocol:
+
+- cohorts `1/2/3`
+- train/eval on day `0/90`
+- rat-level splits
+- `aug_level=mild`, `--no-photometric-aug`
+- `--no-bias-correction`
+
+Important note:
+- `lr=1e-4` underfit badly for Xception in this setup.
+- A fairer Xception baseline used `--lr 1e-3`.
+
+Observed results (Xception, `lr=1e-3`):
+- Control (`day 0/90`): `MAE=23.76`, `RMSE=39.16`, `R²=0.810`
+- HLS (`day 0/90`): `MAE=25.08`, `RMSE=43.57`, `R²=0.781`
+- Control inter-eye mean `|OD-OS|`: `13.20`
+- Control day 90 inter-eye mean `|OD-OS|`: `15.41`
+
+Artifacts:
+- Checkpoint: `outputs/checkpoints/xception_e40_lr1e3_d0090_c123.pt`
+- Metrics: `outputs/predictions/xception_e40_lr1e3_d0090_c123/metrics_summary.csv`
+
+Interpretation:
+- On this **narrow day 0/90 control-priority protocol**, the simple Xception baseline outperformed the current RETFound+MIL setup.
+- This does **not** prove RETFound is unhelpful in general; it means the RETFound advantage was not observed on this slice/protocol.
+
+## Xception + RETFound Feature Distillation (Control-Only, Day 0/90)
+
+A feature-level distillation experiment was added for the Xception baseline:
+
+- Student: Xception
+- Teacher: frozen RETFound checkpoint (feature-only teacher)
+- Distillation loss: MSE on L2-normalized features
+- `--skip-stress-eval` used (control-only experiment)
+
+Run settings (first test):
+- `--distill-alpha 0.3`
+- `--distill-feature-only`
+- `--distill-teacher-ckpt RETFound_MAE_Model/RETFound_mae_natureOCT.pth`
+
+Observed result (control-only):
+- Control (`day 0/90`): `MAE=26.06`, `RMSE=39.37`, `R²=0.808`
+- Control inter-eye mean `|OD-OS|`: `20.30`
+- Control day 90 inter-eye mean `|OD-OS|`: `25.57`
+
+Compared to plain Xception (`lr=1e-3`, same protocol):
+- Control MAE worsened (`23.76 -> 26.06`)
+- Control inter-eye worsened (`13.20 -> 20.30`)
+
+Conclusion (for `alpha=0.3`):
+- RETFound feature distillation did **not** improve Xception on this control-only day `0/90` protocol.
+- If distillation is revisited, reduce `alpha` (e.g. `0.05–0.1`) and keep it feature-only.
+
+Artifacts:
+- Checkpoint: `outputs/checkpoints/xception_e40_lr1e3_d0090_c123_distill_retfoundfeat_a03_b8.pt`
+- Metrics: `outputs/predictions/xception_e40_lr1e3_d0090_c123_distill_retfoundfeat_a03_b8/metrics_summary.csv`
+- Comparison table: `outputs/predictions/compare_xception_vs_xception_distill_retfoundfeat_day0090_controlonly.csv`
+
 ## Bias Correction Warning
 
 For fair model comparison and deployable inference behavior, use:

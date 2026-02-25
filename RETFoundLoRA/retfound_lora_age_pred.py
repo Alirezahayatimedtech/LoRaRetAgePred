@@ -296,7 +296,9 @@ class RETFoundLoRAAgePred(nn.Module):
                  mil_hidden_dim: int = 256,
                  heteroscedastic_regression: bool = False,
                  ordinal_num_bins: int = 0,
-                 ordinal_aux_hidden_dim: int = 0):
+                 ordinal_aux_hidden_dim: int = 0,
+                 use_regime_aux: bool = False,
+                 regime_aux_hidden_dim: int = 0):
         super().__init__()
         self.keep_spatial_tokens = bool(keep_spatial_tokens)
         self.use_pre_adapter = bool(use_pre_adapter)
@@ -305,6 +307,7 @@ class RETFoundLoRAAgePred(nn.Module):
         self.configured_lora_blocks = int(max(0, lora_blocks))
         self.active_lora_blocks = int(max(0, lora_blocks))
         self.ordinal_num_bins = int(max(0, ordinal_num_bins))
+        self.use_regime_aux = bool(use_regime_aux)
 
         self.backbone = load_retfound_backbone_with_lora(
             ckpt_path=ckpt_path,
@@ -337,6 +340,7 @@ class RETFoundLoRAAgePred(nn.Module):
         )
         self.mil_head = None
         self.ordinal_head = None
+        self.regime_head = None
         if self.use_mil_attention:
             self.mil_head = AttentionMILRegressor(
                 in_dim=backbone_channels,
@@ -356,6 +360,14 @@ class RETFoundLoRAAgePred(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout(head_dropout),
                 nn.Linear(aux_hidden, self.ordinal_num_bins - 1),
+            )
+        if self.use_mil_attention and self.use_regime_aux:
+            reg_hidden = int(max(16, regime_aux_hidden_dim or head_hidden_dim))
+            self.regime_head = nn.Sequential(
+                nn.Linear(backbone_channels, reg_hidden),
+                nn.ReLU(inplace=True),
+                nn.Dropout(head_dropout),
+                nn.Linear(reg_hidden, 1),
             )
 
     @staticmethod
@@ -465,6 +477,20 @@ class RETFoundLoRAAgePred(nn.Module):
             raise ValueError(f"Expected pooled_feats shape [B, D], got {tuple(pooled_feats.shape)}")
         return self.ordinal_head(pooled_feats)
 
+    def regime_logits_from_pooled_features(self, pooled_feats: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Predict binary regime logits (young vs old age regime) from pooled bag features [B, D].
+
+        Returns None when the regime auxiliary head is disabled.
+        """
+        if self.regime_head is None:
+            return None
+        if pooled_feats.ndim == 3 and pooled_feats.shape[1] == 1:
+            pooled_feats = pooled_feats.squeeze(1)
+        if pooled_feats.ndim != 2:
+            raise ValueError(f"Expected pooled_feats shape [B, D], got {tuple(pooled_feats.shape)}")
+        return self.regime_head(pooled_feats).view(-1)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.extract_spatial_features(x)
         age_predictions, age_maps = self.head(features)
@@ -507,6 +533,8 @@ class RETFoundLoRAAgePred(nn.Module):
             state["mil_head"] = self.mil_head.state_dict()
         if self.ordinal_head is not None:
             state["ordinal_head"] = self.ordinal_head.state_dict()
+        if self.regime_head is not None:
+            state["regime_head"] = self.regime_head.state_dict()
         torch.save(state, path)
 
     def load_lora_checkpoint(self, path: str):
@@ -536,6 +564,11 @@ class RETFoundLoRAAgePred(nn.Module):
                     self.ordinal_head.load_state_dict(checkpoint["ordinal_head"], strict=False)
                 else:
                     print("[WARN] Checkpoint missing ordinal_head weights; ordinal aux head remains randomly initialized.")
+            if self.regime_head is not None:
+                if "regime_head" in checkpoint:
+                    self.regime_head.load_state_dict(checkpoint["regime_head"], strict=False)
+                else:
+                    print("[WARN] Checkpoint missing regime_head weights; regime aux head remains randomly initialized.")
             if "head" in checkpoint:
                 self.head.load_state_dict(checkpoint["head"])
             else:

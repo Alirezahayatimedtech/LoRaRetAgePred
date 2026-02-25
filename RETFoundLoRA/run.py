@@ -731,6 +731,29 @@ def parse_args():
         help="Hidden dim for ordinal auxiliary head MLP (0 => reuse regression head hidden dim).",
     )
     p.add_argument(
+        "--regime-aux",
+        action="store_true",
+        help="MIL-only: add binary auxiliary head to classify coarse age regime (young vs old) from pooled bag features.",
+    )
+    p.add_argument(
+        "--regime-aux-weight",
+        type=float,
+        default=0.0,
+        help="Weight for binary regime auxiliary BCE loss when --regime-aux is enabled (default: 0 disables).",
+    )
+    p.add_argument(
+        "--regime-aux-age-threshold",
+        type=float,
+        default=180.0,
+        help="Age threshold for regime aux target: age > threshold => old regime (default: 180).",
+    )
+    p.add_argument(
+        "--regime-aux-hidden-dim",
+        type=int,
+        default=0,
+        help="Hidden dim for regime auxiliary head MLP (0 => reuse regression head hidden dim).",
+    )
+    p.add_argument(
         "--mil-control-inter-eye-lambda",
         type=float,
         default=0.0,
@@ -742,6 +765,12 @@ def parse_args():
         default="l1",
         choices=["l1", "smoothl1"],
         help="Penalty type for MIL control inter-eye consistency regularizer.",
+    )
+    p.add_argument(
+        "--mil-control-day90-weight",
+        type=float,
+        default=1.0,
+        help="MIL-only train-time loss upweight for control day-90 bags (default: 1.0 = disabled).",
     )
     p.add_argument(
         "--input-pre-adapter",
@@ -834,6 +863,34 @@ def parse_args():
     p.add_argument("--early-stop-patience", type=int, default=10, help="Early stopping patience (epochs)")
     p.add_argument("--model-type", type=str, default="retfound", choices=["retfound", "xception"], help="Model architecture to use")
     p.add_argument("--baseline-pretrained", action="store_true", help="Use ImageNet-pretrained weights for the Xception baseline (requires cached weights)")
+    p.add_argument(
+        "--distill-teacher-ckpt",
+        type=Path,
+        default=None,
+        help="Feature-distillation teacher checkpoint path (frozen RETFound teacher; Xception student only).",
+    )
+    p.add_argument(
+        "--distill-alpha",
+        type=float,
+        default=0.0,
+        help="Weight for feature distillation loss added to student regression loss (default: 0 disables).",
+    )
+    p.add_argument(
+        "--distill-feature-only",
+        action="store_true",
+        help="Feature-only distillation mode (recommended). Output/prediction distillation is not implemented.",
+    )
+    p.add_argument(
+        "--distill-proj-hidden-dim",
+        type=int,
+        default=512,
+        help="Hidden dim for Xception->RETFound feature projection head used in distillation.",
+    )
+    p.add_argument(
+        "--skip-stress-eval",
+        action="store_true",
+        help="Skip HLS/stress prediction export and metrics (useful for control-only experiments).",
+    )
     p.add_argument("--save-saliency-dir", type=Path, default=None,
                    help="Optional dir to save saliency heatmaps (one PNG per image)")
     p.add_argument("--save-report-dir", type=Path, default=None,
@@ -907,6 +964,12 @@ def build_model(args):
             print(f"[MODEL] Attention-MIL enabled (attn_dim={args.mil_attn_dim}, hidden_dim={args.mil_hidden_dim})")
         if args.mil_attention and getattr(args, "heteroscedastic_regression", False):
             print("[MODEL] Heteroscedastic regression enabled (mu + log_var, Gaussian NLL).")
+        if args.mil_attention and bool(getattr(args, "regime_aux", False)) and float(getattr(args, "regime_aux_weight", 0.0) or 0.0) > 0:
+            print(
+                "[MODEL] Regime auxiliary head enabled "
+                f"(weight={float(getattr(args, 'regime_aux_weight', 0.0)):.4g}, "
+                f"threshold>{float(getattr(args, 'regime_aux_age_threshold', 180.0)):.1f})"
+            )
         if args.input_pre_adapter:
             print(f"[MODEL] Input pre-adapter enabled (hidden={args.input_pre_adapter_hidden})")
         model = RETFoundLoRAAgePred(
@@ -927,6 +990,8 @@ def build_model(args):
             heteroscedastic_regression=bool(getattr(args, "heteroscedastic_regression", False)),
             ordinal_num_bins=int(getattr(args, "ordinal_num_bins", 0) or 0),
             ordinal_aux_hidden_dim=int(getattr(args, "ordinal_aux_hidden_dim", 0) or 0),
+            use_regime_aux=bool(getattr(args, "regime_aux", False) and float(getattr(args, "regime_aux_weight", 0.0) or 0.0) > 0),
+            regime_aux_hidden_dim=int(getattr(args, "regime_aux_hidden_dim", 0) or 0),
     )
     return model
 
@@ -956,6 +1021,16 @@ def run_fold(args):
                 print(f"[MIL] Allowing LoRA adaptation in MIL mode with --lora-blocks {args.lora_blocks}.")
             else:
                 print("[MIL] --no-mil-freeze-backbone set, but --lora-blocks=0 so RETFound remains effectively frozen.")
+
+    if args.distill_teacher_ckpt is not None or float(getattr(args, "distill_alpha", 0.0) or 0.0) > 0:
+        if args.model_type != "xception":
+            raise SystemExit("Feature distillation is currently supported only with --model-type xception.")
+        if getattr(args, "mil_attention", False):
+            raise SystemExit("Feature distillation is not implemented for --mil-attention; use the Xception non-MIL baseline.")
+        if args.distill_teacher_ckpt is None:
+            raise SystemExit("--distill-alpha > 0 requires --distill-teacher-ckpt.")
+        if not bool(getattr(args, "distill_feature_only", False)):
+            print("[DISTILL] Output/prediction distillation is not implemented; proceeding with feature-only distillation.")
 
     progressive_lora_schedule = None
     if getattr(args, "progressive_lora_schedule", None):
@@ -1000,10 +1075,27 @@ def run_fold(args):
             f"lambda={float(args.mil_control_inter_eye_lambda):.4g}, "
             f"loss={getattr(args, 'mil_control_inter_eye_loss', 'l1')}"
         )
+    if getattr(args, "mil_attention", False) and float(getattr(args, "mil_control_day90_weight", 1.0) or 1.0) > 1.0:
+        print(
+            "[MIL] control day-90 loss upweight: "
+            f"x{float(getattr(args, 'mil_control_day90_weight', 1.0)):.4g}"
+        )
     if bool(getattr(args, "ordinal_aux", False)):
         print(
             "[ORD] requested ordinal auxiliary loss: "
             f"weight={float(getattr(args, 'ordinal_aux_weight', 0.0)):.4g}"
+        )
+    if bool(getattr(args, "regime_aux", False)) and float(getattr(args, "regime_aux_weight", 0.0) or 0.0) > 0:
+        print(
+            "[REGIME] requested binary regime auxiliary loss: "
+            f"weight={float(getattr(args, 'regime_aux_weight', 0.0)):.4g}, "
+            f"threshold>{float(getattr(args, 'regime_aux_age_threshold', 180.0)):.1f}"
+        )
+    if args.distill_teacher_ckpt is not None and float(getattr(args, "distill_alpha", 0.0) or 0.0) > 0:
+        print(
+            "[DISTILL] feature-only distillation: "
+            f"teacher={args.distill_teacher_ckpt} | alpha={float(args.distill_alpha):.4g} | "
+            f"proj_hidden={int(getattr(args, 'distill_proj_hidden_dim', 512) or 512)}"
         )
 
     use_folds = args.kfolds and args.kfolds > 1
@@ -1230,6 +1322,19 @@ def run_fold(args):
     control_val_fallback_loader = val_loader
     if args.control_eval_days is not None:
         empty_like = train_df.iloc[0:0]
+        eval_val_df = val_df
+
+        # `--test-image-types` is already applied inside `prepare_data` for test/ctrl_test.
+        # Apply the same filter to the control eval fallback path (val controls) so REGAVG-only
+        # ablations are truly matched on both control and HLS reporting.
+        if args.test_image_types:
+            test_image_types_set = set(args.test_image_types)
+            before_val = len(eval_val_df)
+            eval_val_df = eval_val_df[eval_val_df["image_type"].isin(test_image_types_set)].copy()
+            print(
+                f"[DATA] control eval fallback image types filter {sorted(test_image_types_set)}: "
+                f"val {before_val}->{len(eval_val_df)}"
+            )
 
         def _build_eval_loader_from_df(df_subset: pd.DataFrame):
             if df_subset is None or df_subset.empty:
@@ -1253,7 +1358,7 @@ def run_fold(args):
             return val_like_loader
 
         ctrl_eval_df = filter_df_by_days(ctrl_test_df, args.control_eval_days, "ctrl_eval_holdout")
-        val_ctrl_eval_df = filter_df_by_days(val_df, args.control_eval_days, "ctrl_eval_val_fallback")
+        val_ctrl_eval_df = filter_df_by_days(eval_val_df, args.control_eval_days, "ctrl_eval_val_fallback")
         control_holdout_loader = _build_eval_loader_from_df(ctrl_eval_df)
         control_val_fallback_loader = _build_eval_loader_from_df(val_ctrl_eval_df)
 
@@ -1262,6 +1367,61 @@ def run_fold(args):
         setattr(model, "hetero_target_mean", float(getattr(args, "hetero_target_mean", 0.0) or 0.0))
         setattr(model, "hetero_target_std", float(getattr(args, "hetero_target_std", 1.0) or 1.0))
     trainer = Trainer(model, device)
+    if (
+        args.model_type == "xception"
+        and args.distill_teacher_ckpt is not None
+        and float(getattr(args, "distill_alpha", 0.0) or 0.0) > 0
+    ):
+        teacher = RETFoundLoRAAgePred(
+            ckpt_path=args.distill_teacher_ckpt,
+            img_size=args.img_size,
+            global_pool=False,
+            lora_rank=max(1, int(getattr(args, "lora_rank", 8) or 8)),
+            lora_alpha=float(getattr(args, "lora_alpha", 16.0) or 16.0),
+            lora_blocks=0,
+            lora_dropout=0.0,
+            head_hidden_dim=256,
+            head_dropout=0.0,
+            upsample_factor=None,
+            keep_spatial_tokens=False,
+            use_pre_adapter=False,
+            pre_adapter_hidden_dim=16,
+            use_mil_attention=False,
+            mil_attn_dim=128,
+            mil_hidden_dim=256,
+            heteroscedastic_regression=False,
+            ordinal_num_bins=0,
+            ordinal_aux_hidden_dim=0,
+            use_regime_aux=False,
+            regime_aux_hidden_dim=0,
+        ).to(device)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+
+        teacher_feat_dim = int(getattr(getattr(teacher, "backbone", None), "embed_dim", 0) or 0)
+        if teacher_feat_dim <= 0:
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, int(args.img_size), int(args.img_size), device=device)
+                teacher_feat_dim = int(teacher.extract_image_features(dummy).shape[-1])
+        student_feat_dim = int(getattr(model, "backbone_channels", 0) or 0)
+        if student_feat_dim <= 0 and hasattr(getattr(model, "backbone", None), "num_features"):
+            student_feat_dim = int(model.backbone.num_features)
+        if student_feat_dim <= 0:
+            raise SystemExit("Could not infer Xception student feature dimension for distillation.")
+
+        proj_hidden = int(max(16, getattr(args, "distill_proj_hidden_dim", 512) or 512))
+        model.distill_proj = torch.nn.Sequential(
+            torch.nn.Linear(student_feat_dim, proj_hidden),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(proj_hidden, teacher_feat_dim),
+        ).to(device)
+        trainer.distill_teacher = teacher
+        trainer.distill_alpha = float(args.distill_alpha)
+        print(
+            "[DISTILL] Teacher/student feature dims: "
+            f"student={student_feat_dim} -> teacher={teacher_feat_dim} (proj hidden={proj_hidden})"
+        )
 
     correction = None
     if args.load_correction_json:
@@ -1310,6 +1470,11 @@ def run_fold(args):
                     model.ordinal_head.load_state_dict(ckpt["ordinal_head"], strict=False)
                 else:
                     print("[LOAD] Checkpoint missing ordinal_head weights (ordinal aux enabled in current model).")
+            if args.model_type == "retfound" and hasattr(model, "regime_head") and model.regime_head is not None:
+                if "regime_head" in ckpt:
+                    model.regime_head.load_state_dict(ckpt["regime_head"], strict=False)
+                else:
+                    print("[LOAD] Checkpoint missing regime_head weights (regime aux enabled in current model).")
             if "head" in ckpt:
                 model.head.load_state_dict(ckpt["head"], strict=False)
             if "correction" in ckpt and (args.bias_correction or args.use_saved_correction):
@@ -1452,6 +1617,8 @@ def run_fold(args):
                 save_dict["ordinal_head"] = model.ordinal_head.state_dict()
                 if getattr(args, "ordinal_bin_values_resolved", None):
                     save_dict["ordinal_bin_values"] = [float(v) for v in args.ordinal_bin_values_resolved]
+            if hasattr(model, "regime_head") and model.regime_head is not None:
+                save_dict["regime_head"] = model.regime_head.state_dict()
             if bool(getattr(args, "heteroscedastic_regression", False)):
                 save_dict["hetero_target_norm"] = {
                     "mean": float(getattr(args, "hetero_target_mean", 0.0) or 0.0),
@@ -1505,16 +1672,20 @@ def run_fold(args):
     else:
         print("[PRED] Skipping Controls predictions (no control holdout or val set).")
     stress_csv_name = f"rag_experimental_results{full_suffix}.csv"
-    print("[PRED] Running HLS/Recovery/High_CO2 test set…")
-    trainer.predict_to_csv(
-        test_loader,
-        stress_csv_name,
-        args,
-        device,
-        correction=correction,
-        save_saliency_dir=args.save_saliency_dir if args.save_saliency_dir else None,
-    )
-    stress_csv_path = pred_dir / stress_csv_name
+    stress_csv_path = None
+    if bool(getattr(args, "skip_stress_eval", False)):
+        print("[PRED] Skipping HLS/Recovery/High_CO2 test set (--skip-stress-eval).")
+    else:
+        print("[PRED] Running HLS/Recovery/High_CO2 test set…")
+        trainer.predict_to_csv(
+            test_loader,
+            stress_csv_name,
+            args,
+            device,
+            correction=correction,
+            save_saliency_dir=args.save_saliency_dir if args.save_saliency_dir else None,
+        )
+        stress_csv_path = pred_dir / stress_csv_name
 
     # Optional control-first inter-eye post analysis (paired CSVs + reliability flags + matched-view MIL analysis).
     try:
@@ -1527,6 +1698,8 @@ def run_fold(args):
         ctrl_path = control_csv_path or (pred_dir / f"control_test_results{full_suffix}.csv")
         stress_path = stress_csv_path
         for label, p in (("control", ctrl_path), ("stress", stress_path)):
+            if p is None:
+                continue
             m = compute_metrics_csv(p)
             if m:
                 m["split"] = label

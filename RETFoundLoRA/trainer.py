@@ -59,6 +59,10 @@ class Trainer:
         self.loss_fn = nn.SmoothL1Loss(beta=1.0, reduction="none")
         self._ordinal_bins_cache = {}
         self._warned_ordinal_target_mismatch = False
+        # Optional feature distillation (e.g., Xception student <- frozen RETFound teacher).
+        self.distill_teacher = None
+        self.distill_alpha = 0.0
+        self._warned_distill_unsupported = False
 
     @staticmethod
     def _heteroscedastic_enabled(args) -> bool:
@@ -117,6 +121,45 @@ class Trainer:
         # Skew disabled: use plain Smooth L1 (Huber)
         return raw_loss
 
+    def _feature_distill_enabled(self, args) -> bool:
+        if self.distill_teacher is None:
+            return False
+        if float(getattr(self, "distill_alpha", 0.0) or 0.0) <= 0:
+            return False
+        if args is None:
+            return False
+        if bool(getattr(args, "mil_attention", False)):
+            return False
+        if str(getattr(args, "model_type", "")).lower() != "xception":
+            return False
+        return hasattr(self.model, "distill_proj") and getattr(self.model, "distill_proj", None) is not None
+
+    def _feature_distill_loss(self, imgs: torch.Tensor, student_feats: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        """
+        Feature-level distillation for the Xception baseline:
+        - Student: pooled Xception features -> projection head
+        - Teacher: frozen RETFound pooled features
+        - Loss: MSE on L2-normalized features
+        """
+        if self.distill_teacher is None or getattr(self.model, "distill_proj", None) is None:
+            return None
+        # Student features
+        if not hasattr(self.model, "extract_image_features"):
+            return None
+        if student_feats is None:
+            student_feats = self.model.extract_image_features(imgs)  # [B, D_s]
+        proj = self.model.distill_proj(student_feats)            # [B, D_t]
+        # Frozen teacher features
+        with torch.no_grad():
+            teacher_feats = self.distill_teacher.extract_image_features(imgs)
+        if teacher_feats.ndim != 2 or proj.ndim != 2:
+            return None
+        if teacher_feats.shape != proj.shape:
+            return None
+        s_norm = nn.functional.normalize(proj, dim=1)
+        t_norm = nn.functional.normalize(teacher_feats, dim=1)
+        return nn.functional.mse_loss(s_norm, t_norm, reduction="mean")
+
     def _ordinal_aux_enabled(self, args) -> bool:
         if args is None:
             return False
@@ -125,6 +168,15 @@ class Trainer:
         if float(getattr(args, "ordinal_aux_weight", 0.0) or 0.0) <= 0:
             return False
         return hasattr(self.model, "ordinal_head") and getattr(self.model, "ordinal_head", None) is not None
+
+    def _regime_aux_enabled(self, args) -> bool:
+        if args is None:
+            return False
+        if not bool(getattr(args, "regime_aux", False)):
+            return False
+        if float(getattr(args, "regime_aux_weight", 0.0) or 0.0) <= 0:
+            return False
+        return hasattr(self.model, "regime_head") and getattr(self.model, "regime_head", None) is not None
 
     def _get_ordinal_bins_tensor(self, args) -> Optional[torch.Tensor]:
         vals = getattr(args, "ordinal_bin_values_resolved", None)
@@ -168,6 +220,23 @@ class Trainer:
         ordinal_targets = (class_idx.unsqueeze(1) > thresholds).to(ordinal_logits.dtype)
         loss = nn.functional.binary_cross_entropy_with_logits(ordinal_logits, ordinal_targets, reduction="mean")
         return loss
+
+    def _regime_aux_loss(self, regime_logits: torch.Tensor, targets: torch.Tensor, args) -> Optional[torch.Tensor]:
+        """
+        Binary auxiliary loss for coarse age regime classification from pooled MIL features.
+
+        Default regime split: young <= threshold (0), old > threshold (1).
+        """
+        if regime_logits is None or regime_logits.numel() == 0:
+            return None
+        if regime_logits.ndim != 1:
+            regime_logits = regime_logits.view(-1)
+        tgt = targets.view(-1).to(self.device, dtype=torch.float32)
+        if tgt.numel() != regime_logits.numel():
+            return None
+        th = float(getattr(args, "regime_aux_age_threshold", 180.0) or 180.0)
+        regime_targets = (tgt > th).to(regime_logits.dtype)
+        return nn.functional.binary_cross_entropy_with_logits(regime_logits, regime_targets, reduction="mean")
 
     def _mil_predict_batch(self, batch, return_pooled: bool = False, return_logvar: bool = False):
         """MIL forward for a collated bag batch (bag = rat_id/eye/day)."""
@@ -279,6 +348,42 @@ class Trainer:
             penalty = torch.mean(torch.abs(diffs))
         return penalty, int(diffs.numel())
 
+    def _mil_control_day_loss_weights(self, batch, args, ref: torch.Tensor) -> torch.Tensor:
+        """
+        Optional MIL train-time per-bag weights for control day-specific emphasis.
+
+        Current use: upweight control day 90 bags to improve control day-90 accuracy
+        and reduce OD/OS inconsistency tails without changing the evaluation protocol.
+        """
+        w90 = float(getattr(args, "mil_control_day90_weight", 1.0) or 1.0)
+        if w90 <= 1.0:
+            return torch.ones_like(ref)
+        if not isinstance(batch, dict):
+            return torch.ones_like(ref)
+        groups = batch.get("group", [])
+        days = batch.get("day", None)
+        if days is None:
+            return torch.ones_like(ref)
+        if torch.is_tensor(days):
+            day_vals = days.to(ref.device, dtype=torch.float32).view(-1)
+        else:
+            try:
+                day_vals = torch.as_tensor([float(d) for d in days], dtype=torch.float32, device=ref.device).view(-1)
+            except Exception:
+                return torch.ones_like(ref)
+        n = min(int(ref.numel()), len(groups), int(day_vals.numel()))
+        if n <= 0:
+            return torch.ones_like(ref)
+        weights = torch.ones_like(ref)
+        for i in range(n):
+            g = str(groups[i]).strip().lower()
+            if g != "controls":
+                continue
+            # Day values are nominal integers but stored as float.
+            if abs(float(day_vals[i].item()) - 90.0) <= 0.5:
+                weights[i] = w90
+        return weights
+
     def train_one_epoch(self, loader, optimizer, args) -> float:
         self.model.train()
         total_loss = 0.0
@@ -288,11 +393,16 @@ class Trainer:
                 continue
             if getattr(args, "mil_attention", False):
                 use_ord = self._ordinal_aux_enabled(args)
+                use_regime = self._regime_aux_enabled(args)
                 use_hetero = self._heteroscedastic_enabled(args)
                 if use_hetero:
-                    preds, _, pooled_feats, pred_log_var = self._mil_predict_batch(batch, return_pooled=use_ord, return_logvar=True)
+                    preds, _, pooled_feats, pred_log_var = self._mil_predict_batch(
+                        batch,
+                        return_pooled=(use_ord or use_regime),
+                        return_logvar=True,
+                    )
                 else:
-                    preds, _, pooled_feats = self._mil_predict_batch(batch, return_pooled=use_ord)
+                    preds, _, pooled_feats = self._mil_predict_batch(batch, return_pooled=(use_ord or use_regime))
                     pred_log_var = None
                 targets_clean = batch["age_days"].to(self.device, non_blocking=True).view(-1)
                 targets = targets_clean
@@ -300,19 +410,29 @@ class Trainer:
                     targets = targets + torch.randn_like(targets) * args.label_noise_std
                 if use_hetero and pred_log_var is not None:
                     targets_z = self._hetero_age_to_z(targets, args)
-                    loss = self._gaussian_nll(preds, pred_log_var, targets_z, reduction="mean")
+                    raw_nll = self._gaussian_nll(preds, pred_log_var, targets_z, reduction="none")
+                    weights = self._mil_control_day_loss_weights(batch, args, raw_nll)
+                    denom = torch.clamp(weights.sum(), min=1e-6)
+                    loss = torch.sum(raw_nll * weights) / denom
                     logvar_reg_w = float(getattr(args, "hetero_logvar_reg_weight", 0.0) or 0.0)
                     if logvar_reg_w > 0:
                         loss = loss + logvar_reg_w * torch.mean(pred_log_var ** 2)
                 else:
                     raw_loss = self.loss_fn(preds, targets)
                     raw_loss = self._apply_skew(raw_loss, preds, targets, args)
-                    loss = torch.mean(raw_loss)
+                    weights = self._mil_control_day_loss_weights(batch, args, raw_loss)
+                    denom = torch.clamp(weights.sum(), min=1e-6)
+                    loss = torch.sum(raw_loss * weights) / denom
                 if use_ord and pooled_feats is not None:
                     ord_logits = self.model.ordinal_logits_from_pooled_features(pooled_feats)
                     ord_loss = self._ordinal_aux_loss(ord_logits, targets_clean, args)
                     if ord_loss is not None:
                         loss = loss + float(getattr(args, "ordinal_aux_weight", 0.0)) * ord_loss
+                if use_regime and pooled_feats is not None:
+                    regime_logits = self.model.regime_logits_from_pooled_features(pooled_feats)
+                    regime_loss = self._regime_aux_loss(regime_logits, targets_clean, args)
+                    if regime_loss is not None:
+                        loss = loss + float(getattr(args, "regime_aux_weight", 0.0)) * regime_loss
                 preds_for_cons = self._hetero_z_to_age(preds, args) if use_hetero else preds
                 cons_penalty, _ = self._mil_control_inter_eye_consistency(preds_for_cons, batch, args)
                 if cons_penalty is not None:
@@ -385,8 +505,17 @@ class Trainer:
                     raw_loss = self._apply_skew(raw_loss, preds, targets, args)
                     loss = torch.mean(raw_loss * weights)
                 else:
-                    preds, _ = self.model(imgs)
-                    preds = preds.view(-1)
+                    distill_loss = None
+                    if self._feature_distill_enabled(args):
+                        # Avoid duplicate backbone passes when distilling Xception features.
+                        feats_spatial = self.model.extract_spatial_features(imgs)
+                        preds, _ = self.model.head(feats_spatial)
+                        preds = preds.view(-1)
+                        student_feats = nn.functional.adaptive_avg_pool2d(feats_spatial, 1).squeeze(-1).squeeze(-1)
+                        distill_loss = self._feature_distill_loss(imgs, student_feats=student_feats)
+                    else:
+                        preds, _ = self.model(imgs)
+                        preds = preds.view(-1)
                     targets = targets.view(-1)
                     if args.late_fusion:
                         keys = self._group_keys(batch, days, aggregate_by_rat=getattr(args, "aggregate_by_rat", False))
@@ -406,6 +535,8 @@ class Trainer:
                     raw_loss = self.loss_fn(preds, targets)
                     raw_loss = self._apply_skew(raw_loss, preds, targets, args)
                     loss = torch.mean(raw_loss * weights)
+                    if distill_loss is not None:
+                        loss = loss + float(self.distill_alpha) * distill_loss
 
             optimizer.zero_grad()
             loss.backward()

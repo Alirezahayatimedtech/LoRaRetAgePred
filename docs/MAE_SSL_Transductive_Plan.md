@@ -143,6 +143,45 @@ Tradeoff relative to the `<=90` supervised protocol:
 - Better control metrics and control inter-eye consistency
 - Worse HLS metrics than training on `0/7/14/28/90`
 
+## Xception Baseline and Distillation Follow-up (Control-Only Day 0/90)
+
+To test whether RETFound provides measurable value on the narrow control-priority slice, a matched Xception baseline and a feature-distilled Xception student were run.
+
+### Matched Xception Baseline (`lr=1e-3`)
+
+Protocol:
+- cohorts `1/2/3`
+- train/eval on day `0/90`
+- rat-level splits
+- `aug_level=mild`, `--no-photometric-aug`
+- `--no-bias-correction`
+
+Observed results:
+- Control (`day 0/90`): `MAE=23.76`, `RMSE=39.16`, `R²=0.810`
+- HLS (`day 0/90`): `MAE=25.08`, `RMSE=43.57`, `R²=0.781`
+- Control inter-eye mean `|OD-OS|`: `13.20`
+- Control day 90 inter-eye mean `|OD-OS|`: `15.41`
+
+This outperformed the current RETFound+MIL control-priority setup on the day `0/90` slice.
+
+### Xception + RETFound Feature Distillation (Feature-only, `alpha=0.3`)
+
+Setup:
+- Student: Xception
+- Teacher: frozen RETFound (`RETFound_MAE_Model/RETFound_mae_natureOCT.pth`)
+- Distillation loss: MSE on L2-normalized feature vectors
+- control-only evaluation (`--skip-stress-eval`)
+
+Observed results (control day `0/90` only):
+- Control MAE: `26.06` (worse than plain Xception `23.76`)
+- Control RMSE: `39.37`
+- Control R²: `0.808`
+- Control inter-eye mean `|OD-OS|`: `20.30` (worse than plain Xception `13.20`)
+
+Conclusion for this first distillation test:
+- Feature distillation from the human RETFound teacher at `alpha=0.3` did **not** improve Xception on the control-only day `0/90` protocol.
+- If retried, use a smaller `alpha` (e.g. `0.05–0.1`) and keep feature-only distillation.
+
 ## Reporting Guidance
 
 When presenting results, label clearly:
