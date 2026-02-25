@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Assemble a compact Paper #1 (control-only) results bundle from completed runs.
 
-This script does not rerun experiments. It copies/symlinks existing summaries,
+This script does not rerun experiments. It copies existing summaries,
 tables, and figures into ``outputs/paper1`` and writes an execution status report
 that marks supported/unsupported steps in the current codebase.
 """
@@ -22,6 +22,12 @@ def ensure_parent(p: Path) -> None:
 
 
 def copy_file(src: Path, dst: Path, summary: list[dict], required: bool = True) -> bool:
+    try:
+        if src.resolve() == dst.resolve():
+            summary.append({"action": "copy", "src": str(src), "dst": str(dst), "status": "same_file_skip"})
+            return src.exists()
+    except Exception:
+        pass
     if not src.exists():
         summary.append({"action": "copy", "src": str(src), "dst": str(dst), "status": "missing"})
         if required:
@@ -173,16 +179,14 @@ This bundle was assembled from completed experiments in the current codebase.
 - Aggregated summary: `outputs/paper1/exp01_retfound_lora/summary.csv`
 - Status: completed and reused
 
-### EXP-02 (Backbone ablation, supported subset)
-- Source: `outputs/ablation/`
-- RETFound + Xception completed
-- Random ViT baseline not implemented in current `run.py`
+### EXP-02 (Backbone ablation)
+- Source: `outputs/paper1/ablation/` (assembled from executed ablation runs)
+- RETFound + Xception + Random ViT completed
 - Aggregated summary: `outputs/paper1/ablation/backbone_comparison.csv`
 
 ### EXP-03 (LoRA vs Full FT vs Frozen head-only)
-- Status: not fully runnable in current codebase as specified
-- Reason: clean full RETFound fine-tuning path (MIL) is not exposed via `run.py`; current implementation is PEFT-focused (LoRA/frozen variants).
-- Placeholder note written under `outputs/paper1/lora_ablation/README_skipped.txt`
+- Status: completed (patched full RETFound fine-tuning support in MIL path)
+- Summary: `outputs/paper1/lora_ablation/summary.csv`
 
 ### EXP-04 (Inter-eye reliability)
 - Source: `outputs/core/exp03_inter_eye/summary.csv`
@@ -205,8 +209,8 @@ This bundle was assembled from completed experiments in the current codebase.
 - Aggregate: `outputs/generalization/exp07_loo_mae50_mil_lora4_d0090/loo_summary.csv`
 
 ## Main Claims Supported by Current Results
-1. On the narrow control-only day 0/90 benchmark, Xception is a stronger baseline than the current RETFound+MIL configuration (backbone ablation).
-2. RETFound pipelines remain useful for broader analyses (CV, saliency, OOD/HLS summaries) and for structured experimentation (MIL, LoRA, SSL variants).
+1. On the narrow control-only day 0/90 benchmark, Xception is a stronger backbone baseline than RETFound+MIL+LoRA (backbone ablation).
+2. In the RETFound adaptation ablation, full fine-tuning outperforms LoRA and frozen-head-only under the current control-only day 0/90 protocol.
 3. Human RETFound feature distillation into Xception (α=0.3) degrades control-priority performance; rat-adapted teacher distillation (α=0.1) improves RMSE/R² vs human-teacher distill but does not beat plain Xception on control MAE/inter-eye reliability.
 4. LOCO cohort results confirm severe cross-cohort generalization failure for held-out cohort 3 when training excludes the older age regime (age extrapolation dominates).
 
@@ -230,7 +234,8 @@ def main() -> None:
 
     # Core summaries
     copy_file(root / "outputs/core/exp01_ctrl_cv/summary.csv", out_root / "exp01_retfound_lora/summary.csv", actions)
-    copy_file(root / "outputs/ablation/backbone_comparison.csv", out_root / "ablation/backbone_comparison.csv", actions)
+    if not copy_file(root / "outputs/paper1/ablation/backbone_comparison.csv", out_root / "ablation/backbone_comparison.csv", actions, required=False):
+        copy_file(root / "outputs/ablation/backbone_comparison.csv", out_root / "ablation/backbone_comparison.csv", actions)
     copy_file(root / "outputs/core/exp03_inter_eye/summary.csv", out_root / "exp04_inter_eye/summary.csv", actions)
 
     # Saliency pointer (avoid copying ~1GB)
@@ -241,13 +246,8 @@ def main() -> None:
     )
     write_text(out_root / "exp05_saliency/README.txt", saliency_note, actions)
 
-    # Unsupported/skipped EXP-03 note
-    lora_note = (
-        "EXP-03 (LoRA vs full fine-tuning vs frozen head-only) was not executed as specified.\n"
-        "Reason: a clean full RETFound fine-tuning path in the MIL pipeline is not exposed in current run.py.\n"
-        "Existing results focus on LoRA-based PEFT and backbone ablations.\n"
-    )
-    write_text(out_root / "lora_ablation/README_skipped.txt", lora_note, actions)
+    # EXP-03 adaptation ablation (completed)
+    copy_file(root / "outputs/paper1/lora_ablation/summary.csv", out_root / "lora_ablation/summary.csv", actions, required=False)
 
     # Distillation summary (optional experiment summary from existing runs)
     build_distillation_summary(root, out_root / "distillation_summary.csv", actions)

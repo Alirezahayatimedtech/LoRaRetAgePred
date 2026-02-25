@@ -34,6 +34,30 @@ class AgePredictionHead(nn.Module):
         return age_predictions, age_maps
 
 
+class AgePredictionVectorHead(nn.Module):
+    """Vector MLP head (for CLS-style features) with interface-compatible outputs."""
+
+    def __init__(self, in_dim: int, hidden_dim: int = 256, dropout: float = 0.2):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if x.ndim == 4:
+            if x.shape[-2:] != (1, 1):
+                x = F.adaptive_avg_pool2d(x, 1)
+            x = x.squeeze(-1).squeeze(-1)
+        elif x.ndim != 2:
+            raise RuntimeError(f"Expected [B,D] or [B,D,1,1], got {tuple(x.shape)}")
+        pred = self.mlp(x)
+        age_maps = pred.unsqueeze(-1).unsqueeze(-1)  # pseudo map for interface compatibility
+        return pred, age_maps
+
+
 class SimpleXceptionAgePred(nn.Module):
     """Xception baseline with spatial head, interface-compatible with RETFoundLoRAAgePred."""
 
@@ -70,6 +94,56 @@ class SimpleXceptionAgePred(nn.Module):
         return self.head(feats)
 
     # Compatibility stubs (save/load full state since no LoRA)
+    def save_lora_checkpoint(self, path: str):
+        torch.save(self.state_dict(), path)
+
+    def load_lora_checkpoint(self, path: str):
+        state = torch.load(path, map_location="cpu")
+        self.load_state_dict(state, strict=True)
+
+
+class SimpleViTRandomAgePred(nn.Module):
+    """Random-init ViT baseline with a small regression head (no pretraining)."""
+
+    def __init__(self, model_name: str = "vit_base_patch16_224", head_hidden_dim: int = 256, head_dropout: float = 0.2):
+        super().__init__()
+        self.model_name = model_name
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=False,
+            num_classes=0,
+            global_pool="",
+        )
+        self.backbone_channels = int(getattr(self.backbone, "num_features", 768))
+        self.head = AgePredictionVectorHead(
+            in_dim=self.backbone_channels,
+            hidden_dim=head_hidden_dim,
+            dropout=head_dropout,
+        )
+        self.distill_proj = None
+
+    def _forward_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        feats = self.backbone.forward_features(x)
+        # timm ViTs usually return [B, N, C] tokens; some variants may return [B, C].
+        return feats
+
+    def extract_image_features(self, x: torch.Tensor) -> torch.Tensor:
+        feats = self._forward_tokens(x)
+        if feats.ndim == 3:
+            # CLS token
+            return feats[:, 0, :]
+        if feats.ndim == 2:
+            return feats
+        raise RuntimeError(f"Unexpected ViT feature shape: {tuple(feats.shape)}")
+
+    def extract_spatial_features(self, x: torch.Tensor) -> torch.Tensor:
+        vec = self.extract_image_features(x)
+        return vec.unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+
+    def forward(self, x: torch.Tensor):
+        feats = self.extract_spatial_features(x)
+        return self.head(feats)
+
     def save_lora_checkpoint(self, path: str):
         torch.save(self.state_dict(), path)
 

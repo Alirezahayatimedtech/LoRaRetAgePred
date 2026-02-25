@@ -171,12 +171,26 @@ def table4_backbone(backbone_cmp_csv: Path, out_dir: Path) -> List[Path]:
     return outputs
 
 
+def table5_lora_ablation(lora_ablation_csv: Path, out_dir: Path) -> List[Path]:
+    outputs: List[Path] = []
+    if not lora_ablation_csv.exists():
+        print(f"[WARN] LoRA ablation summary not found: {lora_ablation_csv}")
+        return outputs
+    df = pd.read_csv(lora_ablation_csv)
+    p = out_dir / "table5_lora_adaptation_ablation.csv"
+    safe_mkdir_for_file(p)
+    df.to_csv(p, index=False)
+    outputs.append(p)
+    return outputs
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate manuscript tables from experiment outputs")
     ap.add_argument("--exp01-dir", type=Path, default=Path("outputs/core/exp01_ctrl_cv"))
     ap.add_argument("--exp02-dir", type=Path, default=Path("outputs/core/exp02_hls_ood"))
     ap.add_argument("--mad-summary-csv", type=Path, default=Path("outputs/core/exp03_inter_eye/summary.csv"))
     ap.add_argument("--backbone-comparison-csv", type=Path, default=Path("outputs/ablation/backbone_comparison.csv"))
+    ap.add_argument("--lora-ablation-csv", type=Path, default=Path("outputs/paper1/lora_ablation/summary.csv"))
     ap.add_argument("--out-dir", type=Path, default=Path("outputs/paper_ready/tables"))
     ap.add_argument("--all", action="store_true", help="Generate all available tables (default behavior)")
     args = ap.parse_args()
@@ -187,6 +201,7 @@ def main() -> None:
     produced += table2_hls_rag(args.exp02_dir, out_dir)
     produced += table3_inter_eye(args.mad_summary_csv, out_dir)
     produced += table4_backbone(args.backbone_comparison_csv, out_dir)
+    produced += table5_lora_ablation(args.lora_ablation_csv, out_dir)
 
     index_csv = out_dir / "generated_tables_index.csv"
     safe_mkdir_for_file(index_csv)

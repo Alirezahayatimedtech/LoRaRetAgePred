@@ -17,8 +17,7 @@ This document records the **executed** protocol and results for the current code
   - EXP-03-like: inter-eye reliability aggregation
   - EXP-04-like: saliency export (gradient-saliency fallback for CLS-only checkpoints)
 - Backbone ablation runner: `scripts/paper/run_backbone_ablation.sh`
-  - Supported in current codebase: `RETFound`, `Xception`
-  - Random ViT baseline not implemented in `run.py`
+  - Completed: `RETFound`, `Xception`, `vit_random`
 - Tables/Figures:
   - `scripts/generate_paper_tables.py --all`
   - `scripts/generate_paper_figures.py --all`
@@ -44,11 +43,9 @@ This document records the **executed** protocol and results for the current code
 - EXP-06 optional distillation summary: summarized from completed distillation runs
 - Additional LOCO cohort generalization: completed (all held-out cohorts 1/2/3)
 
-### Skipped / Not Fully Supported (Current Codebase)
-- EXP-03 (`LoRA vs full fine-tune vs frozen head-only`) as specified
-  - Reason: a clean **full RETFound fine-tuning** path for the MIL pipeline is not exposed in `RETFoundLoRA/run.py`; the implementation is PEFT/LoRA-centric.
-- Random ViT baseline in backbone ablation
-  - Reason: `run.py` supports `retfound` and `xception` only.
+### Remaining Gaps (Current Codebase)
+- The runbook's exact hypothetical YAML/CLI interface was not used literally.
+- EXP-06 optional distillation `α=0.05` rat-teacher row remains unrun (summary marks it unavailable).
 
 ## Key Results (Executed Runs)
 
@@ -61,14 +58,27 @@ Source: `outputs/core/exp01_ctrl_cv/summary.csv`
 | HLS | `30.34 ± 1.12` | `46.38 ± 1.36` | `0.751 ± 0.015` | `0.882 ± 0.003` |
 
 ### 2) Backbone ablation (control-priority day 0/90 protocol)
-Source: `outputs/ablation/backbone_comparison.csv`
+Source: `outputs/paper1/ablation/backbone_comparison.csv`
 
 | Model | Control MAE | Control R² | HLS MAE | HLS R² | Control inter-eye mean | HLS inter-eye mean |
 |---|---:|---:|---:|---:|---:|---:|
 | RETFound (MAE-transductive) + MIL + LoRA4 | `34.75` | `0.581` | `30.30` | `0.729` | `15.71` | `15.68` |
 | Xception | **`23.44`** | **`0.791`** | **`26.97`** | **`0.732`** | `19.13` | `16.13` |
+| Random ViT (frozen head-only baseline) | `70.46` | `0.090` | `71.21` | `0.128` | `5.47` | `5.97` |
 
-### 3) Inter-eye reliability aggregate (core run aggregation)
+### 3) RETFound adaptation ablation (LoRA vs full fine-tune vs frozen head-only)
+Source: `outputs/paper1/lora_ablation/summary.csv`
+
+Control/HLS summary (day 0/90):
+- `full_ft`: Control MAE `26.87`, HLS MAE `23.31` (best of the three)
+- `lora`: Control MAE `34.90`, HLS MAE `31.78`
+- `frozen_head`: Control MAE `55.26`, HLS MAE `55.85`
+
+Interpretation:
+- In this narrow control-priority protocol, full RETFound fine-tuning outperformed LoRA and frozen-head-only.
+- Frozen head-only underfits severely.
+
+### 4) Inter-eye reliability aggregate (core run aggregation)
 Source: `outputs/core/exp03_inter_eye/summary.csv`
 
 Selected rows (overall):
@@ -78,7 +88,7 @@ Selected rows (overall):
 Per-cohort/day breakdown is preserved in:
 - `outputs/paper1/exp04_inter_eye/summary.csv`
 
-### 4) Distillation summary (Xception student, control-only day 0/90)
+### 5) Distillation summary (Xception student, control-only day 0/90)
 Source: `outputs/paper1/distillation_summary.csv`
 
 | Model | MAE | RMSE | R² | Inter-eye mean | Inter-eye Q95 | Day90 MAE |
@@ -91,7 +101,7 @@ Interpretation:
 - Human-teacher distillation degrades control-priority performance.
 - Rat-adapted teacher improves RMSE/R² and Day90 MAE vs human-teacher distill, but still does **not** beat plain Xception on overall control MAE and inter-eye reliability.
 
-### 5) LOCO cohort generalization (added experiment)
+### 6) LOCO cohort generalization (added experiment)
 Source: `outputs/generalization/exp07_loo_mae50_mil_lora4_d0090/loo_summary_with_inter_eye.csv`
 
 | Held-out Cohort | Split | MAE | RMSE | R² | Inter-eye mean | Inter-eye Q95 |
@@ -111,10 +121,11 @@ Interpretation:
 
 1. **Xception is a strong control-only baseline on day 0/90** and outperforms the current RETFound+MIL setup on the narrow control-priority slice.
 2. **RETFound pipelines remain experimentally valuable** for CV, OOD/HLS summaries, saliency, MIL/LoRA/SSL ablations, and structured generalization studies.
-3. **Feature distillation must be teacher/domain-aware**:
+3. **Under the current day 0/90 control-priority RETFound protocol, full fine-tuning beats LoRA PEFT**, while frozen-head-only clearly underfits.
+4. **Feature distillation must be teacher/domain-aware**:
    - human RETFound teacher features hurt Xception (α=0.3),
    - rat-adapted RETFound teacher features partially recover performance (better RMSE/R²), but do not surpass Xception on control MAE/inter-eye.
-4. **Cross-cohort generalization is constrained by age-regime coverage**:
+5. **Cross-cohort generalization is constrained by age-regime coverage**:
    - LOCO cohort 3 failure indicates severe age extrapolation/domain-shift when the older regime is absent from training.
 
 ## Locations of Paper-Ready Assets
@@ -123,4 +134,3 @@ Interpretation:
 - Figures: `outputs/paper1/figures/`
 - Compact execution bundle: `outputs/paper1/`
 - Local execution report: `outputs/paper1/EXECUTION_REPORT.md`
-

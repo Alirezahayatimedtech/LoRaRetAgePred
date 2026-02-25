@@ -583,7 +583,7 @@ from config import (
     OUTPUT_ROOT,
 )
 from retfound_lora_age_pred import RETFoundLoRAAgePred  # noqa: E402
-from simple_baseline import SimpleXceptionAgePred  # noqa: E402
+from simple_baseline import SimpleXceptionAgePred, SimpleViTRandomAgePred  # noqa: E402
 from bias_correction import fit_linear_correction, apply_correction, fit_poly_correction, apply_poly_correction  # noqa: E402
 from trainer import Trainer  # noqa: E402
 import eval_suite_retfound as eval_suite  # noqa: E402
@@ -673,6 +673,11 @@ def parse_args():
                    help="LoRA alpha (suggested: 16, 32, 64; often ~2x rank)")
     p.add_argument("--lora-dropout", type=float, default=LORA_DROPOUT,
                    help="LoRA dropout (suggested: 0.05–0.30)")
+    p.add_argument(
+        "--retfound-full-finetune",
+        action="store_true",
+        help="RETFound only: unfreeze the entire RETFound backbone (use with --lora-blocks 0 for true full fine-tuning).",
+    )
     p.add_argument("--upsample-factor", type=int, default=UPSAMPLE_FACTOR)
     p.add_argument(
         "--keep-spatial-tokens",
@@ -875,7 +880,12 @@ def parse_args():
     p.add_argument("--lr-patience", type=int, default=3, help="LR scheduler patience (epochs) for Plateau scheduler")
     p.add_argument("--lr-factor", type=float, default=0.5, help="LR scheduler decay factor when plateauing")
     p.add_argument("--early-stop-patience", type=int, default=10, help="Early stopping patience (epochs)")
-    p.add_argument("--model-type", type=str, default="retfound", choices=["retfound", "xception"], help="Model architecture to use")
+    p.add_argument("--model-type", type=str, default="retfound", choices=["retfound", "xception", "vit_random"], help="Model architecture to use")
+    p.add_argument("--freeze-backbone", action="store_true",
+                   help="Baseline models (xception/vit_random): freeze backbone and train head only.")
+    p.add_argument("--no-freeze-backbone", action="store_false", dest="freeze_backbone",
+                   help="Baseline models (xception/vit_random): allow backbone training.")
+    p.set_defaults(freeze_backbone=False)
     p.add_argument("--baseline-pretrained", action="store_true", help="Use ImageNet-pretrained weights for the Xception baseline (requires cached weights)")
     p.add_argument(
         "--distill-teacher-ckpt",
@@ -974,6 +984,21 @@ def build_model(args):
             head_hidden_dim=256,
             head_dropout=args.lora_dropout,
         )
+        if bool(getattr(args, "freeze_backbone", False)):
+            for p in model.backbone.parameters():
+                p.requires_grad = False
+            print("[MODEL] Baseline backbone frozen (head-only training).")
+    elif args.model_type == "vit_random":
+        print("[MODEL] Using random-init ViT baseline")
+        model = SimpleViTRandomAgePred(
+            model_name="vit_base_patch16_224",
+            head_hidden_dim=256,
+            head_dropout=args.lora_dropout,
+        )
+        if bool(getattr(args, "freeze_backbone", False)):
+            for p in model.backbone.parameters():
+                p.requires_grad = False
+            print("[MODEL] Baseline backbone frozen (head-only training).")
     else:
         print("[MODEL] Using RETFound + LoRA")
         if args.global_pool:
@@ -1012,7 +1037,13 @@ def build_model(args):
             ordinal_aux_hidden_dim=int(getattr(args, "ordinal_aux_hidden_dim", 0) or 0),
             use_regime_aux=bool(getattr(args, "regime_aux", False) and float(getattr(args, "regime_aux_weight", 0.0) or 0.0) > 0),
             regime_aux_hidden_dim=int(getattr(args, "regime_aux_hidden_dim", 0) or 0),
-    )
+        )
+        if bool(getattr(args, "retfound_full_finetune", False)):
+            if args.lora_blocks > 0:
+                print("[WARN] --retfound-full-finetune with --lora-blocks>0 keeps LoRA-injected attention layers. For true full FT use --lora-blocks 0.")
+            for p in model.backbone.parameters():
+                p.requires_grad = True
+            print("[MODEL] RETFound full backbone fine-tuning enabled (all backbone params trainable).")
     return model
 
 
