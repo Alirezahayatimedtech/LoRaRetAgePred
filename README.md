@@ -273,3 +273,52 @@ The current linear bias-correction path is retrospective and can use true age du
 - `--batch-size` in MIL mode means **bags per batch**, not images per batch.
 - `--control-eval-days 0 90` only restricts the control evaluation path (not HLS days).
 - `--no-photometric-aug` disables train-time photometric augmentation but keeps fixed robust intensity normalization.
+
+## Reproducing Paper #1 Results
+
+### Prerequisites
+
+- Python `3.9+`
+- PyTorch `2.x` with CUDA (tested on CUDA `11.x/12.x` setups)
+- Install project dependencies (environment varies by local setup):
+
+```bash
+pip install -r requirements.txt
+```
+
+If `requirements.txt` is not present in your local clone, use the environment described in `environment.yml` (local project root) and install the package set used for the runs in this repo (`torch`, `torchvision`, `timm`, `pandas`, `scikit-learn`, `matplotlib`, `Pillow`, etc.).
+
+### Run Core Paper #1 Pipeline
+
+```bash
+./run_paper1_all.sh
+```
+
+This executes the current paper pipeline wrapper (skip-if-done behavior), including:
+- control-only CV
+- backbone ablation
+- LOCO cohort generalization
+- paper table/figure generation
+- compact paper bundle assembly
+
+### Key Outputs
+
+- `outputs/paper1/exp01_retfound_lora/summary.csv` — main control-only CV summary
+- `outputs/paper1/ablation/backbone_comparison.csv` — backbone ablation summary
+- `outputs/paper1/lora_ablation/summary.csv` — RETFound adaptation ablation (LoRA/full FT/frozen head)
+- `outputs/paper1/exp04_inter_eye/summary.csv` — inter-eye reliability summary
+- `outputs/paper1/tables/` — manuscript-ready tables (CSV outputs from generator)
+- `outputs/paper1/figures/` — generated figure assets
+- `outputs/paper1/EXECUTION_REPORT.md` — executed methods/results/claims audit
+
+### Data Access (OSD-679)
+
+OSD-679 data is not bundled in this repository. Request access via NASA GeneLab:
+
+- https://genelab-data.ndc.nasa.gov/genelab/accession/OSD-679
+
+### Notes on Reproducibility
+
+- All supervised experiments use rat-level splits (no rat overlap across train/val/test within runs).
+- MAE-based SSL adaptation results are explicitly labeled **transductive** when unlabeled images from evaluation rats are used.
+- For fair model comparisons, use `--no-bias-correction` unless you are reporting retrospective calibrated metrics separately.
