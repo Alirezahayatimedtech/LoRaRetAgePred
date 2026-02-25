@@ -38,6 +38,7 @@ for p in (REPO_ROOT, REPO_ROOT / "RETFoundLoRA"):
 from config import BACKBONE_CKPT, IMAGE_TYPES, IMG_SIZE  # type: ignore
 from data_prep_age_lora import load_metadata  # type: ignore
 from retfound_lora_age_pred import RETFoundLoRAAgePred  # type: ignore
+from simple_baseline import SimpleXceptionAgePred  # type: ignore
 from utils import normalize_eye_side  # type: ignore
 
 
@@ -106,6 +107,7 @@ def collate_batch(batch: List[dict]):
 
 
 def load_model(
+    model_type: str,
     backbone_ckpt: Path,
     lora_ckpt: Path,
     device: torch.device,
@@ -115,16 +117,22 @@ def load_model(
     lora_blocks: int,
     lora_dropout: float,
 ):
-    model = RETFoundLoRAAgePred(
-        ckpt_path=backbone_ckpt,
-        img_size=img_size,
-        global_pool=False,
-        lora_rank=int(lora_rank),
-        lora_alpha=float(lora_alpha),
-        lora_blocks=int(lora_blocks),
-        lora_dropout=float(lora_dropout),
-        upsample_factor=4,  # higher native saliency resolution
-    ).to(device)
+    model_type = str(model_type).lower()
+    if model_type == "retfound":
+        model = RETFoundLoRAAgePred(
+            ckpt_path=backbone_ckpt,
+            img_size=img_size,
+            global_pool=False,
+            lora_rank=int(lora_rank),
+            lora_alpha=float(lora_alpha),
+            lora_blocks=int(lora_blocks),
+            lora_dropout=float(lora_dropout),
+            upsample_factor=4,  # higher native saliency resolution
+        ).to(device)
+    elif model_type == "xception":
+        model = SimpleXceptionAgePred(pretrained=False).to(device)
+    else:
+        raise SystemExit(f"Unsupported --model-type: {model_type}")
     ckpt = torch.load(lora_ckpt, map_location="cpu")
     if isinstance(ckpt, dict) and "backbone_lora" in ckpt and "head" in ckpt:
         model.backbone.load_state_dict(ckpt["backbone_lora"], strict=False)
@@ -290,6 +298,7 @@ def save_overlay(
 
 def parse_args():
     p = argparse.ArgumentParser(description="Save saliency overlays for filtered subset")
+    p.add_argument("--model-type", type=str, default="retfound", choices=["retfound", "xception"])
     p.add_argument("--csv", type=Path, default=Path("metadata/image_age_mapping.csv"))
     p.add_argument("--cohorts", type=str, nargs="*", default=["1"])
     p.add_argument("--days", type=int, nargs="*", default=[90])
@@ -341,6 +350,7 @@ def main():
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=pin, collate_fn=collate_batch)
 
     model = load_model(
+        args.model_type,
         args.backbone_ckpt,
         args.lora_ckpt,
         device,
