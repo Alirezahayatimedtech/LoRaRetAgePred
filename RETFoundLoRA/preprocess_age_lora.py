@@ -277,6 +277,8 @@ def prepare_data(
     test_single_image: bool = False,
     include_recovery_days: bool = False,
     cohorts_to_keep: Optional[List[str]] = COHORTS_TO_KEEP,
+    train_cohorts_to_keep: Optional[List[str]] = None,
+    test_cohorts_to_keep: Optional[List[str]] = None,
     exclude_recovery_paths: bool = False,
     train_groups: List[str] = None,
     test_groups: List[str] = None,
@@ -367,6 +369,23 @@ def prepare_data(
     # If no explicit test_groups, leave test_pool empty to avoid reusing train data
     test_pool = df[df["group_norm"].isin(test_groups_set)] if test_groups_set else df.iloc[0:0]
 
+    def _filter_pool_by_cohorts(pool_df: pd.DataFrame, cohorts_keep: Optional[List[str]], label: str) -> pd.DataFrame:
+        if cohorts_keep is None or pool_df is None or pool_df.empty or "cohort" not in pool_df.columns:
+            return pool_df
+        keep = {str(c).strip() for c in cohorts_keep if str(c).strip() != ""}
+        if not keep:
+            return pool_df
+        before = len(pool_df)
+        out = pool_df[pool_df["cohort"].astype(str).isin(keep)].copy()
+        if len(out) != before:
+            print(f"[INFO] {label} cohort filter {sorted(keep)}: {before}->{len(out)} rows")
+        else:
+            print(f"[INFO] {label} cohort filter {sorted(keep)}: no change ({before} rows)")
+        return out
+
+    train_pool = _filter_pool_by_cohorts(train_pool, train_cohorts_to_keep, "train_pool")
+    test_pool = _filter_pool_by_cohorts(test_pool, test_cohorts_to_keep, "test_pool")
+
     if holdout_day is not None:
         before = len(train_pool)
         train_pool = train_pool[train_pool["day"] != int(holdout_day)]
@@ -450,6 +469,35 @@ def prepare_data(
         test_df = test_df.drop_duplicates(subset=["rat_id", "eye", "day"])
         ctrl_test_df = ctrl_test_df.drop_duplicates(subset=["rat_id", "eye", "day"])
         print(f"[INFO] Test single-image mode: test {before_test}->{len(test_df)}, ctrl_test {before_ctrl}->{len(ctrl_test_df)} (dedup by rat_id/eye/day)")
+
+    # If the held-out test pool includes the same normalized groups as training
+    # (e.g., LOCO Controls in addition to HLS), route those rows to ctrl_test_df so
+    # control reporting uses the external held-out cohort rather than the internal
+    # train-pool control holdout.
+    overlap_groups = set(train_groups_set).intersection(test_groups_set)
+    if overlap_groups and not test_df.empty and "group_norm" in test_df.columns:
+        mask_overlap = test_df["group_norm"].isin(overlap_groups)
+        external_ctrl_df = test_df[mask_overlap].copy()
+        if not external_ctrl_df.empty:
+            before_ctrl = len(ctrl_test_df)
+            before_test = len(test_df)
+            test_df = test_df[~mask_overlap].copy()
+            if before_ctrl:
+                print(
+                    "[INFO] LOCO control routing: replacing internal ctrl_test "
+                    f"({before_ctrl} rows) with external held-out test rows from groups "
+                    f"{sorted(overlap_groups)} ({len(external_ctrl_df)} rows)."
+                )
+            else:
+                print(
+                    "[INFO] LOCO control routing: using external held-out test rows from groups "
+                    f"{sorted(overlap_groups)} as ctrl_test ({len(external_ctrl_df)} rows)."
+                )
+            ctrl_test_df = external_ctrl_df.drop_duplicates().reset_index(drop=True)
+            print(
+                f"[INFO] LOCO control routing complete: test {before_test}->{len(test_df)}, "
+                f"ctrl_test={len(ctrl_test_df)}"
+            )
 
     loaders = make_loaders(
         train_df,

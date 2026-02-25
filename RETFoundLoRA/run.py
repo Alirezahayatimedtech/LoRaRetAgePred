@@ -606,6 +606,20 @@ def parse_args():
         help="Override cohorts to keep (e.g., --cohorts 1 2). Default uses config COHORTS_TO_KEEP.",
     )
     p.add_argument(
+        "--train-cohorts",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional train/val cohort filter applied only to training pools (e.g., --train-cohorts 1 2).",
+    )
+    p.add_argument(
+        "--test-cohorts",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional held-out test cohort filter applied only to test pools (e.g., --test-cohorts 3).",
+    )
+    p.add_argument(
         "--day-whitelist",
         type=int,
         nargs="*",
@@ -943,6 +957,12 @@ def parse_args():
         args.day_whitelist = list(DAY_WHITELIST) if DAY_WHITELIST is not None else None
     if args.control_eval_days is not None:
         args.control_eval_days = sorted({int(d) for d in args.control_eval_days})
+    if args.cohorts is not None:
+        args.cohorts = [str(c) for c in args.cohorts]
+    if args.train_cohorts is not None:
+        args.train_cohorts = [str(c) for c in args.train_cohorts]
+    if args.test_cohorts is not None:
+        args.test_cohorts = [str(c) for c in args.test_cohorts]
     return args
 
 
@@ -1050,13 +1070,40 @@ def run_fold(args):
                 args.lora_blocks = int(max_sched_blocks)
             print(f"[LoRA] Progressive schedule (epoch->active_blocks): {progressive_lora_schedule}")
 
+    def _uniq_cohorts(vals):
+        if vals is None:
+            return None
+        seen = set()
+        out = []
+        for v in vals:
+            s = str(v).strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    base_cohorts = _uniq_cohorts(args.cohorts if args.cohorts is not None else COHORTS_TO_KEEP)
+    train_cohorts_only = _uniq_cohorts(args.train_cohorts)
+    test_cohorts_only = _uniq_cohorts(args.test_cohorts)
+    if train_cohorts_only is not None or test_cohorts_only is not None:
+        if train_cohorts_only is None:
+            train_cohorts_only = list(base_cohorts) if base_cohorts is not None else None
+        if test_cohorts_only is None:
+            test_cohorts_only = list(base_cohorts) if base_cohorts is not None else None
+        loader_cohorts_keep = _uniq_cohorts((train_cohorts_only or []) + (test_cohorts_only or []))
+    else:
+        loader_cohorts_keep = base_cohorts
+
     device = torch.device(args.device)
     print(f"[DEVICE] requested={args.device} | torch.cuda.is_available()={torch.cuda.is_available()} | using={device}")
     if device.type == "cuda" and not torch.cuda.is_available():
         print("[WARN] CUDA device requested but torch.cuda.is_available() is False. Check driver/NVML access (see torch.version.cuda).")
         print("[WARN] Falling back to CPU; training will be slow.")
     print(f"[DATA] day_whitelist={'ALL' if args.day_whitelist is None else args.day_whitelist}")
-    print(f"[DATA] cohorts_to_keep={args.cohorts if args.cohorts is not None else COHORTS_TO_KEEP}")
+    print(f"[DATA] cohorts_to_keep={loader_cohorts_keep}")
+    if train_cohorts_only is not None or test_cohorts_only is not None:
+        print(f"[DATA] train_cohorts={train_cohorts_only} | test_cohorts={test_cohorts_only}")
     print(f"[AUG] photometric_aug={'OFF' if args.no_photometric_aug else 'ON'} | aug_level={args.aug_level}")
     if getattr(args, "mil_attention", False):
         print(
@@ -1143,7 +1190,9 @@ def run_fold(args):
             test_image_types=args.test_image_types,
             test_single_image=args.test_single_image,
             include_recovery_days=False,
-            cohorts_to_keep=(args.cohorts if args.cohorts is not None else COHORTS_TO_KEEP),
+            cohorts_to_keep=loader_cohorts_keep,
+            train_cohorts_to_keep=train_cohorts_only,
+            test_cohorts_to_keep=test_cohorts_only,
             exclude_recovery_paths=False,
             train_groups=args.train_groups,
             test_groups=args.test_groups,
@@ -1222,7 +1271,9 @@ def run_fold(args):
             test_image_types=args.test_image_types,
             test_single_image=args.test_single_image,
             include_recovery_days=False,
-            cohorts_to_keep=(args.cohorts if args.cohorts is not None else COHORTS_TO_KEEP),
+            cohorts_to_keep=loader_cohorts_keep,
+            train_cohorts_to_keep=train_cohorts_only,
+            test_cohorts_to_keep=test_cohorts_only,
             exclude_recovery_paths=False,
             train_groups=args.train_groups,
             test_groups=args.test_groups,
