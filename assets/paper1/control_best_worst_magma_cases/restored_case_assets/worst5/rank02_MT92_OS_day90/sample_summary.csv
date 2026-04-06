@@ -1,0 +1,2 @@
+bucket,rank,rat_id,day,eye,n_images,cohort,group,age_true,age_pred,abs_error
+worst,2,MT92,90,OS,4,3,Controls,360.0,246.1669311523437,113.83306884765628
