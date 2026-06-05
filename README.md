@@ -7,6 +7,26 @@ Brown Norway rat OCT age-prediction workspace built around `RETFoundLoRA`, match
 - `RETFoundLoRA/`: RETFound + LoRA age-regression pipeline, evaluation helpers, manuscript assets, and experimental runners.
 - `scripts/paper/`: scripts used to build paper tables, figures, reviewer-mode manuscript copies, and the reproducibility bundle.
 - `reproducibility/osd679_age_prediction_release/`: polished supplementary-data package for the age-prediction paper.
+- `docs/rag_delta_biomarker_analysis.md`: current RAG/DeltaRAG biomarker-analysis summary across Cohorts 1-3 and all available days.
+- `docs/rag_method_recommendations.md`: recommended statistical framing, interpretation limits, and spaceflight-use-case notes.
+- `results/rag_delta_biomarker/`: compact RAG/DeltaRAG result tables.
+
+## RAG / DeltaRAG biomarker analysis
+
+The current RAG analysis uses the image-only RETFound-LoRA NatureOCT model trained on controls only, evaluated with 3-fold rat-level cross-validation across Cohorts 1-3 and all available days.
+
+Key result:
+
+- Control out-of-fold age MAE was about 31-34 days across folds.
+- DeltaRAG did not strongly separate HLS from controls; day-90 AUROC was about 0.51 and day-14 was only a weak trend.
+- The strongest biological signal was recovery-phase RAG versus temporal choroidal thickness in HLS rats: residualized Pearson r about -0.85, BH-adjusted q about 0.0036.
+- Biomarker-fusion age modeling was stopped after weak partial results and is documented only as exploratory because it creates circularity for biomarker-correlation claims.
+
+Start here:
+
+- `docs/rag_delta_biomarker_analysis.md`
+- `docs/rag_method_recommendations.md`
+- `results/rag_delta_biomarker/README.md`
 
 ## OSD-679 reproducibility bundle
 
@@ -49,6 +69,7 @@ This repo provides:
 - rat-level split definitions
 - benchmark-facing tables and summaries
 - qualitative sample indices used in the manuscript
+- RAG/DeltaRAG biomarker-analysis summaries
 
 To fully reproduce the experiments, pair this repository with a local OSD-679 checkout obtained through NASA GeneLab / the Open Science Data Repository.
 
@@ -57,3 +78,4 @@ To fully reproduce the experiments, pair this repository with a local OSD-679 ch
 - `chronological_age_days` preserves the raw metadata-derived age.
 - `benchmark_age_days` reflects the age implied by the benchmark day label used in the paper protocol.
 - The scratch/random ViT baseline is kept only as a supplementary negative-control architecture check, not as a main competing model.
+- For biomarker-discovery claims, use image-only RAG as the primary endpoint; biomarker-input age models are exploratory only.
